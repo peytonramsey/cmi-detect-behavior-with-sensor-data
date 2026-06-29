@@ -8,6 +8,5 @@ The project is intended as an end-to-end study in multimodal machine learning un
 
 - [Data Dictionary](data-dictionary.md)
 
-## Documentation
+> **Resources:** [Data Dictionary](data-dictionary.md)
 
-- [Data Dictionary](data-dictionary.md)
