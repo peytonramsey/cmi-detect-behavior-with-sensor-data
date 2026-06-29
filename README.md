@@ -4,3 +4,10 @@ A wrist-worn sensor classification problem focused on building a model that dist
 
 The project is intended as an end-to-end study in multimodal machine learning under realistic constraints. The core challenge is to learn robust behavioral patterns from noisy sequential data while handling sensor-specific structure, subject variation, and missing signals that appear in the evaluation setting.
 
+## Documentation
+
+- [Data Dictionary](data-dictionary.md)
+
+## Documentation
+
+- [Data Dictionary](data-dictionary.md)
