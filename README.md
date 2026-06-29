@@ -4,5 +4,7 @@ A wrist-worn sensor classification problem focused on building a model that dist
 
 The project is intended as an end-to-end study in multimodal machine learning under realistic constraints. The core challenge is to learn robust behavioral patterns from noisy sequential data while handling sensor-specific structure, subject variation, and missing signals that appear in the evaluation setting.
 
+Aims to develop a predictive model capable of distinguishing (1) BFRB-like gestures from non-BFRB-like gestures and (2) the specific type of BFRB-like gesture.
+
 > **Resources:** [Data Dictionary](data-dictionary.md)
 
