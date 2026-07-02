@@ -22,6 +22,20 @@ The broader motivation comes from the Child Mind Institute's **Healthy Brain Net
 - `model_comparison.qmd`: Comparison of engineered-feature tree models against raw-sequence deep learning models (1D-CNN, LSTM, GRU), missing-modality handling strategies, ensembling, post-processing, and interpretability analysis (feature importance, SHAP).
 - `data-dictionary.md`: Column-level documentation for the sensor, demographic, and label data.
 
+## Visuals
+
+**Class distribution across 18 gesture types (sequence level):**
+
+![Class Imbalance](assets/class_imbalance.png)
+
+**Thermopile signal distribution: BFRB gestures run warmer due to sustained skin or hair contact with the sensor:**
+
+![Thermopile Warmth](assets/thermopile_warmth.png)
+
+**Thermopile separation by phase: the BFRB warmth advantage concentrates in the Gesture phase and narrows during Transition, consistent with contact-driven heating:**
+
+![Thermopile Separation by Phase](assets/thermopile_by_phase.png)
+
 ## Key Results
 
 The best-performing model is an XGBoost classifier on engineered statistical features, reaching a macro F1 of 0.5241 on full-sensor sequences, ahead of a 1D-CNN trained on raw IMU time-series (macro F1 0.4414) and recurrent models (GRU 0.3414, LSTM 0.2796) [file:8]. Hand-crafted statistical aggregations (e.g., acceleration standard deviation, thermopile mean) capture most of the discriminative signal in the raw sensor trace, and deep sequence models did not clearly surpass the tree-based baseline at the scale evaluated here.
