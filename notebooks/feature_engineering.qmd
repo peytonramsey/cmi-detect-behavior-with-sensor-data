@@ -1,0 +1,929 @@
+---
+title: "Feature Engineering 02"
+jupyter: cmi-venv
+---
+
+```{python}
+#| echo: false
+#| output: false
+
+import polars as pl
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy import stats
+from scipy.signal import welch
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+```
+
+```{python}
+#| echo: false
+#| output: false
+
+train_df = pl.read_csv("../data/train.csv")
+test_df = pl.read_csv("../data/test.csv")
+
+bfrb_gestures = {
+    "Above ear - pull hair", "Cheek - pinch skin", "Eyebrow - pull hair",
+    "Eyelash - pull hair", "Forehead - pull hairline", "Forehead - scratch",
+    "Neck - pinch skin", "Neck - scratch", "Pinch knee/leg skin", "Scratch knee/leg skin",
+}
+train_df = train_df.with_columns(
+    pl.col("gesture").is_in(bfrb_gestures).alias("is_bfrb"),
+    pl.mean_horizontal([pl.col(c).abs() for c in ["acc_x", "acc_y", "acc_z"]]).alias("acc_mag"),
+)
+
+# Handedness axis-mirror fix (from eda-01.qmd), applied upstream of every question
+# below: acc_x/rot_x sign is handedness-dependent, so left-handed subjects
+# (handedness == 0) get mirrored before any feature in this notebook uses these
+# axes. An assertion guards against silently running on unmirrored data.
+demo_df = pl.read_csv("../data/train_demographics.csv")
+train_df = train_df.join(demo_df, on="subject", how="left")
+train_df = train_df.with_columns([
+    pl.when(pl.col("handedness") == 0).then(-pl.col("acc_x")).otherwise(pl.col("acc_x")).alias("acc_x"),
+    pl.when(pl.col("handedness") == 0).then(-pl.col("rot_x")).otherwise(pl.col("rot_x")).alias("rot_x"),
+])
+
+mirror_check = (
+    train_df.group_by("handedness").agg(pl.col("acc_x").mean().alias("acc_x_mean")).sort("handedness")
+)
+gap_after_mirror = (
+    mirror_check.filter(pl.col("handedness") == 1).select("acc_x_mean").item()
+    - mirror_check.filter(pl.col("handedness") == 0).select("acc_x_mean").item()
+)
+assert abs(gap_after_mirror) < 0.5, (
+    f"acc_x mirroring assertion failed: handedness groups are still {gap_after_mirror:.2f} "
+    "apart after mirroring -- check the handedness encoding before trusting acc_x/rot_x "
+    "anywhere downstream in this notebook."
+)
+```
+
+# questions to answer: 
+
+## Phase-Level Aggregation
+
+1. Does computing features separately per phase (Transition / Pause / Gesture) improve separability compared to whole-sequence features?
+
+```{python}
+#| echo: false
+
+feature_cols = [
+    "length", "acc_mag_mean", "acc_mag_std", "acc_mag_median",
+    "acc_mag_min", "acc_mag_max", "acc_mag_skew", "acc_mag_kurtosis",
+    "acc_mag_entropy", "acc_mag_range", "acc_mag_iqr",
+]
+
+def compute_acc_mag_stats(df: pl.DataFrame, group_keys: list[str]) -> pl.DataFrame:
+    return (
+        df
+        .group_by(group_keys)
+        .agg(
+            pl.len().alias("length"),
+            pl.col("acc_mag").mean().alias("acc_mag_mean"),
+            pl.col("acc_mag").std().alias("acc_mag_std"),
+            pl.col("acc_mag").median().alias("acc_mag_median"),
+            pl.col("acc_mag").min().alias("acc_mag_min"),
+            pl.col("acc_mag").max().alias("acc_mag_max"),
+            pl.col("acc_mag").skew().alias("acc_mag_skew"),
+            pl.col("acc_mag").kurtosis().alias("acc_mag_kurtosis"),
+            pl.col("acc_mag").entropy().alias("acc_mag_entropy"),
+            pl.col("acc_mag").quantile(0.25).alias("acc_mag_q25"),
+            pl.col("acc_mag").quantile(0.75).alias("acc_mag_q75"),
+        )
+        .with_columns(
+            (pl.col("acc_mag_max") - pl.col("acc_mag_min")).alias("acc_mag_range"),
+            (pl.col("acc_mag_q75") - pl.col("acc_mag_q25")).alias("acc_mag_iqr"),
+        )
+        .drop("acc_mag_q25", "acc_mag_q75")
+    )
+
+# whole-sequence features: one row per sequence_id, no phase split
+whole_seq_features = compute_acc_mag_stats(train_df, ["sequence_id", "is_bfrb"])
+
+# phase-level features: one row per (sequence_id, phase), pivoted wide so each
+# sequence has Transition_*/Gesture_* columns side by side for comparison
+phase_long = compute_acc_mag_stats(train_df, ["sequence_id", "is_bfrb", "phase"])
+phase_wide = phase_long.pivot(index=["sequence_id", "is_bfrb"], on="phase", values=feature_cols)
+
+def cohens_d(df: pl.DataFrame, col: str) -> float:
+    pdf = df.select(["is_bfrb", col]).to_pandas()
+    g1 = pdf.loc[pdf["is_bfrb"], col].dropna()
+    g0 = pdf.loc[~pdf["is_bfrb"], col].dropna()
+    pooled_std = np.sqrt(((g1.std() ** 2) + (g0.std() ** 2)) / 2)
+    return (g1.mean() - g0.mean()) / pooled_std if pooled_std > 0 else 0.0
+
+whole_seq_d = {f: cohens_d(whole_seq_features, f) for f in feature_cols}
+phase_d = {
+    c: cohens_d(phase_wide, c)
+    for c in phase_wide.columns
+    if c not in ("sequence_id", "is_bfrb")
+}
+
+print("Whole-sequence feature effect sizes (Cohen's d):")
+for f, d in sorted(whole_seq_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+
+print("\nTop 10 phase-level feature effect sizes (Cohen's d):")
+for f, d in sorted(phase_d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:10]:
+    print(f"  {f}: d = {d:.3f}")
+
+best_whole = max(abs(d) for d in whole_seq_d.values())
+best_phase = max(abs(d) for d in phase_d.values())
+print(f"\nBest |d| whole-sequence: {best_whole:.3f}  |  Best |d| phase-level: {best_phase:.3f}")
+```
+
+2. Which statistical features carry the most class-discriminating variance for IMU channels? Prioritize std, IQR, jerk, and skewness, EDA showed acc_mag_std (d = -0.76) and acc_jerk_mean (d = -0.68) are the strongest candidates. Treat mean-based features as a baseline to confirm they add nothing?
+
+```{python}
+#| echo: false
+
+imu_channels = ["acc_x", "acc_y", "acc_z", "acc_mag", "rot_w", "rot_x", "rot_y", "rot_z"]
+
+# jerk = abs difference between consecutive rows within a sequence, per channel
+imu_with_jerk = (
+    train_df
+    .sort("sequence_id", "sequence_counter")
+    .with_columns([
+        (pl.col(c) - pl.col(c).shift(1).over("sequence_id")).abs().alias(f"{c}_jerk")
+        for c in imu_channels
+    ])
+)
+
+agg_exprs = [pl.len().alias("length")]
+for c in imu_channels:
+    agg_exprs += [
+        pl.col(c).mean().alias(f"{c}_mean"),
+        pl.col(c).std().alias(f"{c}_std"),
+        pl.col(c).quantile(0.25).alias(f"{c}_q25"),
+        pl.col(c).quantile(0.75).alias(f"{c}_q75"),
+        pl.col(c).skew().alias(f"{c}_skew"),
+        pl.col(f"{c}_jerk").mean().alias(f"{c}_jerk_mean"),
+    ]
+
+imu_seq_features = (
+    imu_with_jerk
+    .group_by("sequence_id", "is_bfrb")
+    .agg(agg_exprs)
+    .with_columns([
+        (pl.col(f"{c}_q75") - pl.col(f"{c}_q25")).alias(f"{c}_iqr") for c in imu_channels
+    ])
+    .drop([f"{c}_q25" for c in imu_channels] + [f"{c}_q75" for c in imu_channels])
+)
+
+feature_names = []
+for c in imu_channels:
+    feature_names += [f"{c}_mean", f"{c}_std", f"{c}_iqr", f"{c}_skew", f"{c}_jerk_mean"]
+
+d_results = {f: cohens_d(imu_seq_features, f) for f in feature_names}
+ranked = sorted(d_results.items(), key=lambda kv: abs(kv[1]), reverse=True)
+
+print("Top 15 IMU features by |Cohen's d|:")
+for f, d in ranked[:15]:
+    print(f"  {f}: d = {d:.3f}")
+
+mean_features = [f for f in feature_names if f.endswith("_mean") and not f.endswith("_jerk_mean")]
+other_features = [f for f in feature_names if f not in mean_features]
+mean_avg_d, mean_max_d = np.mean([abs(d_results[f]) for f in mean_features]), np.max([abs(d_results[f]) for f in mean_features])
+other_avg_d, other_max_d = np.mean([abs(d_results[f]) for f in other_features]), np.max([abs(d_results[f]) for f in other_features])
+
+print(f"\nMean-based features:      avg |d| = {mean_avg_d:.3f}, max |d| = {mean_max_d:.3f}")
+print(f"Std/IQR/skew/jerk features: avg |d| = {other_avg_d:.3f}, max |d| = {other_max_d:.3f}")
+```
+
+3. Does mean absolute difference of acc during the Transition phase add signal, given that Transition has higher length variability (std 34.7) than Gesture (std 3.6)?
+
+```{python}
+#| echo: false
+
+# "mean absolute difference" = mean(|x_t - x_t-1|) between consecutive samples
+# within a sequence (i.e. jerk) -- NOT statistical MAD (deviation from the mean),
+# and `.mad()` is not a real Polars Expr method, so it must be computed manually.
+
+def phase_mad(df: pl.DataFrame, phase: str) -> pl.DataFrame:
+    return (
+        df
+        .filter(pl.col("phase") == phase)
+        .sort("sequence_id", "sequence_counter")
+        .with_columns(
+            (pl.col("acc_mag") - pl.col("acc_mag").shift(1).over("sequence_id")).abs().alias("acc_mag_diff")
+        )
+        .group_by("sequence_id", "is_bfrb")
+        .agg(
+            pl.col("acc_mag_diff").mean().alias("acc_mag_mad"),
+            pl.len().alias("phase_length"),
+        )
+    )
+
+transition_mad = phase_mad(train_df, "Transition")
+gesture_mad = phase_mad(train_df, "Gesture")
+
+transition_d = cohens_d(transition_mad, "acc_mag_mad")
+gesture_d = cohens_d(gesture_mad, "acc_mag_mad")
+
+# does the Transition phase's length variability bleed into the MAD value itself?
+length_corr = transition_mad.select(pl.corr("phase_length", "acc_mag_mad", method="spearman")).item()
+
+print(f"Cohen's d, Transition-phase acc_mag MAD: {transition_d:.3f}")
+print(f"Cohen's d, Gesture-phase acc_mag MAD:    {gesture_d:.3f}")
+print(f"Cohen's d, whole-sequence acc_mag jerk (Q2): {d_results['acc_mag_jerk_mean']:.3f}")
+print(f"\nSpearman corr(Transition phase_length, MAD): {length_corr:.3f}")
+```
+
+## IMU-Specific Features
+
+4. Do quaternion-derived features (rotation magnitude, quaternion norm stability) add signal beyond raw `rot_w/x/y/z` statistics?
+
+```{python}
+#| echo: false
+
+# quat_norm: should sit near 1.0 for a valid unit quaternion -- its deviation/spread
+# reflects sensor-fusion noise ("norm stability"). rotation_angle = 2*arccos(w) is the
+# total rotation magnitude encoded by the quaternion, independent of rotation axis.
+quat_derived = (
+    train_df
+    .with_columns(
+        (pl.col("rot_w") ** 2 + pl.col("rot_x") ** 2 + pl.col("rot_y") ** 2 + pl.col("rot_z") ** 2)
+        .sqrt().alias("quat_norm"),
+        (2 * pl.col("rot_w").clip(-1.0, 1.0).arccos()).alias("rotation_angle"),
+    )
+    .group_by("sequence_id", "is_bfrb")
+    .agg(
+        pl.col("quat_norm").mean().alias("quat_norm_mean"),
+        pl.col("quat_norm").std().alias("quat_norm_std"),
+        pl.col("rotation_angle").mean().alias("rotation_angle_mean"),
+        pl.col("rotation_angle").std().alias("rotation_angle_std"),
+        pl.col("rotation_angle").quantile(0.25).alias("rotation_angle_q25"),
+        pl.col("rotation_angle").quantile(0.75).alias("rotation_angle_q75"),
+    )
+    .with_columns(
+        (pl.col("rotation_angle_q75") - pl.col("rotation_angle_q25")).alias("rotation_angle_iqr"),
+    )
+)
+
+quat_feature_names = [
+    "quat_norm_mean", "quat_norm_std",
+    "rotation_angle_mean", "rotation_angle_std", "rotation_angle_iqr",
+]
+quat_d = {f: cohens_d(quat_derived, f) for f in quat_feature_names}
+raw_rot_d = {f: d for f, d in d_results.items() if f.startswith("rot_")}
+
+print("Quaternion-derived features:")
+for f, d in sorted(quat_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+
+print("\nTop 8 raw rot_w/x/y/z features (from Q2):")
+for f, d in sorted(raw_rot_d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:8]:
+    print(f"  {f}: d = {d:.3f}")
+
+best_quat = max(abs(d) for d in quat_d.values())
+best_raw_rot = max(abs(d) for d in raw_rot_d.values())
+print(f"\nBest |d| quaternion-derived: {best_quat:.3f}  |  Best |d| raw rot_w/x/y/z: {best_raw_rot:.3f}")
+```
+
+5. Does acc_mag as a scalar simplify representation without losing information, given that EDA shows its std (d = -0.76) is discriminative but its mean is flat?
+
+```{python}
+#| echo: false
+
+acc_mag_d = {f: d for f, d in d_results.items() if f.startswith("acc_mag_")}
+acc_axis_d = {f: d for f, d in d_results.items() if f.startswith(("acc_x_", "acc_y_", "acc_z_"))}
+
+print("acc_mag (scalar) features:")
+for f, d in sorted(acc_mag_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+
+print("\nTop 8 per-axis (acc_x/y/z) features:")
+for f, d in sorted(acc_axis_d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:8]:
+    print(f"  {f}: d = {d:.3f}")
+
+best_mag = max(abs(d) for d in acc_mag_d.values())
+best_axis = max(abs(d) for d in acc_axis_d.values())
+print(f"\nBest |d| acc_mag: {best_mag:.3f}  |  Best |d| per-axis: {best_axis:.3f}")
+
+```
+
+6. Are dominant frequency components (FFT peak frequency, spectral entropy) meaningful for differentiating cyclical vs. discrete gestures?
+
+```{python}
+#| echo: false
+
+# no documented sample rate exists for this sensor, so frequency is reported in
+# cycles/sample (relative units), not Hz -- still valid for comparing peak sharpness
+# and spectral concentration across sequences.
+gesture_traces = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .sort("sequence_id", "sequence_counter")
+    .group_by("sequence_id", "is_bfrb", maintain_order=True)
+    .agg(pl.col("acc_mag"))
+)
+
+def spectral_features(values: list[float]) -> tuple[float, float]:
+    arr = np.array(values)
+    if len(arr) < 4:
+        return np.nan, np.nan
+    freqs, psd = welch(arr, fs=1.0, nperseg=min(len(arr), 32))
+    mask = freqs > 0
+    freqs, psd = freqs[mask], psd[mask]
+    if psd.sum() == 0:
+        return np.nan, np.nan
+    peak_freq = freqs[np.argmax(psd)]
+    spec_entropy = stats.entropy(psd / psd.sum())
+    return peak_freq, spec_entropy
+
+spectral_results = [spectral_features(v) for v in gesture_traces["acc_mag"].to_list()]
+peak_freqs, spec_entropies = zip(*spectral_results)
+
+spectral_df = gesture_traces.select(["sequence_id", "is_bfrb"]).with_columns(
+    pl.Series("peak_freq", peak_freqs),
+    pl.Series("spectral_entropy", spec_entropies),
+)
+
+peak_freq_d = cohens_d(spectral_df, "peak_freq")
+spec_entropy_d = cohens_d(spectral_df, "spectral_entropy")
+
+print(f"Cohen's d, Gesture-phase peak frequency: {peak_freq_d:.3f}")
+print(f"Cohen's d, Gesture-phase spectral entropy: {spec_entropy_d:.3f}")
+
+```
+
+## Thermopile Features
+
+7. Are differences between adjacent thermopile channels informative, does spatial heat gradient distinguish contact gestures?
+
+```{python}
+#| echo: false
+
+# "adjacent" = consecutive sensor index (thm_1..thm_5); true physical layout
+# beyond the numbering isn't documented, so this is the best available proxy.
+thm_cols = [f"thm_{i}" for i in range(1, 6)]
+
+thm_gradient_seq = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .with_columns(
+        (pl.col("thm_2") - pl.col("thm_1")).alias("thm_grad_12"),
+        (pl.col("thm_3") - pl.col("thm_2")).alias("thm_grad_23"),
+        (pl.col("thm_4") - pl.col("thm_3")).alias("thm_grad_34"),
+        (pl.col("thm_5") - pl.col("thm_4")).alias("thm_grad_45"),
+        (pl.max_horizontal(thm_cols) - pl.min_horizontal(thm_cols)).alias("thm_spatial_range"),
+        pl.mean_horizontal(thm_cols).alias("thm_row_mean"),
+    )
+    .group_by("sequence_id", "is_bfrb")
+    .agg(
+        pl.col("thm_grad_12").mean().alias("thm_grad_12_mean"),
+        pl.col("thm_grad_23").mean().alias("thm_grad_23_mean"),
+        pl.col("thm_grad_34").mean().alias("thm_grad_34_mean"),
+        pl.col("thm_grad_45").mean().alias("thm_grad_45_mean"),
+        pl.col("thm_spatial_range").mean().alias("thm_spatial_range_mean"),
+        pl.col("thm_row_mean").mean().alias("thm_mean_level"),
+    )
+)
+
+gradient_features = [
+    "thm_grad_12_mean", "thm_grad_23_mean", "thm_grad_34_mean",
+    "thm_grad_45_mean", "thm_spatial_range_mean",
+]
+gradient_d = {f: cohens_d(thm_gradient_seq, f) for f in gradient_features}
+level_d = cohens_d(thm_gradient_seq, "thm_mean_level")
+
+# thm_5 is heavily missing in this dataset (EDA), which directly weakens thm_grad_45
+n_valid_grad45 = thm_gradient_seq.filter(pl.col("thm_grad_45_mean").is_not_null()).height
+n_total = thm_gradient_seq.height
+
+print("Thermopile gradient features (Gesture phase):")
+for f, d in sorted(gradient_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+print(f"\nFor comparison, raw thm mean level: d = {level_d:.3f}")
+print(f"thm_grad_45 valid for {n_valid_grad45}/{n_total} sequences (thm_5 missingness limits this one)")
+```
+
+8. Does the temporal trend of thermopile values within the Gesture phase (rising vs. flat) carry class signal? Should thermopile features be computed from raw values, subject z-normalized values, or both, and does normalization interact with the adult/child split?
+
+```{python}
+#| echo: false
+
+# demo_df is already joined onto train_df upstream (data-loading cell), so
+# adult_child is already a column here -- no separate join needed.
+gesture_thm = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .with_columns(pl.mean_horizontal(thm_cols).alias("thm_row_mean"))
+)
+
+# rising/flat trend: second-half-of-gesture mean minus first-half-of-gesture mean
+gesture_thm = gesture_thm.with_columns(
+    pl.col("sequence_counter").rank().over("sequence_id").alias("pos_rank"),
+    pl.len().over("sequence_id").alias("seq_len"),
+)
+trend_seq = (
+    gesture_thm
+    .group_by("sequence_id", "is_bfrb")
+    .agg(
+        pl.when(pl.col("pos_rank") <= pl.col("seq_len") / 2)
+          .then(pl.col("thm_row_mean")).mean().alias("thm_first_half_mean"),
+        pl.when(pl.col("pos_rank") > pl.col("seq_len") / 2)
+          .then(pl.col("thm_row_mean")).mean().alias("thm_second_half_mean"),
+    )
+    .with_columns(
+        (pl.col("thm_second_half_mean") - pl.col("thm_first_half_mean")).alias("thm_trend"),
+    )
+)
+trend_d = cohens_d(trend_seq, "thm_trend")
+
+# subject z-normalization must be fit on enough of that subject's own sequences to
+# be trustworthy. Subjects with fewer than 3 Gesture-phase sequences fall back to
+# the raw value instead of a z-score, and thm_subj_z_reliable marks which rows
+# actually got normalized vs. fell back, so downstream consumers can tell the two apart.
+gesture_thm = gesture_thm.with_columns(
+    pl.col("sequence_id").n_unique().over("subject").alias("subject_n_seq"),
+)
+gesture_thm = gesture_thm.with_columns(
+    (pl.col("subject_n_seq") >= 3).alias("thm_subj_z_reliable"),
+)
+gesture_thm = gesture_thm.with_columns(
+    pl.when(
+        (pl.col("thm_row_mean").std().over("subject") > 0) & pl.col("thm_subj_z_reliable")
+    )
+      .then(
+          (pl.col("thm_row_mean") - pl.col("thm_row_mean").mean().over("subject"))
+          / pl.col("thm_row_mean").std().over("subject")
+      )
+      .otherwise(pl.col("thm_row_mean"))
+      .alias("thm_row_mean_z")
+)
+
+seq_level = (
+    gesture_thm
+    .group_by("sequence_id", "is_bfrb", "adult_child")
+    .agg(
+        pl.col("thm_row_mean").mean().alias("thm_mean_raw"),
+        pl.col("thm_row_mean_z").mean().alias("thm_mean_z"),
+        pl.col("thm_subj_z_reliable").first().alias("thm_subj_z_reliable"),
+    )
+)
+n_unreliable = seq_level.filter(~pl.col("thm_subj_z_reliable")).height
+
+raw_d_all = cohens_d(seq_level, "thm_mean_raw")
+z_d_all = cohens_d(seq_level, "thm_mean_z")
+raw_d_adult = cohens_d(seq_level.filter(pl.col("adult_child") == 1), "thm_mean_raw")
+z_d_adult = cohens_d(seq_level.filter(pl.col("adult_child") == 1), "thm_mean_z")
+raw_d_child = cohens_d(seq_level.filter(pl.col("adult_child") == 0), "thm_mean_raw")
+z_d_child = cohens_d(seq_level.filter(pl.col("adult_child") == 0), "thm_mean_z")
+
+group_counts = {
+    row["adult_child"]: row["n"]
+    for row in seq_level.group_by("adult_child").agg(pl.len().alias("n")).to_dicts()
+}
+
+print(f"Trend feature (second-half minus first-half thm mean): d = {trend_d:.3f}")
+print(f"Sequences with thm_subj_z_reliable=False (subject has <3 Gesture sequences, fell back to raw): {n_unreliable}")
+print(f"\nGroup sizes: adult (adult_child=1) n={group_counts.get(1, 0)}, child (adult_child=0) n={group_counts.get(0, 0)}")
+print(f"Raw thm mean:        all d={raw_d_all:.3f}  adult d={raw_d_adult:.3f}  child d={raw_d_child:.3f}")
+print(f"Subject-z thm mean:  all d={z_d_all:.3f}  adult d={z_d_adult:.3f}  child d={z_d_child:.3f}")
+
+```
+
+## ToF Features
+
+9. What is the best way to summarize the 8x8 ToF grid, mean, max, active-pixel count (values not -1), or spatial statistics?
+
+```{python}
+#| echo: false
+
+# restricted to the Gesture phase: contact/proximity behavior is what ToF should
+# capture, and this is where Q7/Q8 found thermopile signal too.
+tof_sensors = range(1, 6)
+
+def pixel_cols(sensor: int) -> list[str]:
+    return [f"tof_{sensor}_v{p}" for p in range(64)]
+
+def valid_exprs(sensor: int) -> list[pl.Expr]:
+    # -1 means "no object in range", not a real distance -- mask it to null so
+    # horizontal aggregations (which skip nulls) ignore it automatically.
+    return [pl.when(pl.col(c) == -1).then(None).otherwise(pl.col(c)) for c in pixel_cols(sensor)]
+
+naive_mean_per_sensor = [pl.mean_horizontal(pixel_cols(s)) for s in tof_sensors]
+valid_mean_per_sensor = [pl.mean_horizontal(valid_exprs(s)) for s in tof_sensors]
+valid_min_per_sensor = [pl.min_horizontal(valid_exprs(s)) for s in tof_sensors]
+valid_max_per_sensor = [pl.max_horizontal(valid_exprs(s)) for s in tof_sensors]
+active_count_per_sensor = [
+    pl.sum_horizontal([(pl.col(c) != -1).cast(pl.Int32) for c in pixel_cols(s)]) for s in tof_sensors
+]
+valid_std_per_sensor = []
+for s in tof_sensors:
+    ve = valid_exprs(s)
+    m = pl.mean_horizontal(ve)
+    m2 = pl.mean_horizontal([e ** 2 for e in ve])
+    valid_std_per_sensor.append((m2 - m ** 2).sqrt())
+
+tof_row = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .select(
+        pl.col("sequence_id"),
+        pl.col("is_bfrb"),
+        pl.mean_horizontal(naive_mean_per_sensor).alias("tof_naive_mean"),
+        pl.mean_horizontal(valid_mean_per_sensor).alias("tof_valid_mean"),
+        pl.mean_horizontal(valid_min_per_sensor).alias("tof_valid_min"),
+        pl.mean_horizontal(valid_max_per_sensor).alias("tof_valid_max"),
+        pl.mean_horizontal(active_count_per_sensor).alias("tof_active_count"),
+        pl.mean_horizontal(valid_std_per_sensor).alias("tof_valid_std"),
+    )
+)
+
+tof_method_features = [
+    "tof_naive_mean", "tof_valid_mean", "tof_valid_min",
+    "tof_valid_max", "tof_active_count", "tof_valid_std",
+]
+tof_seq = (
+    tof_row
+    .group_by("sequence_id", "is_bfrb")
+    .agg([pl.col(c).mean() for c in tof_method_features])
+)
+
+tof_method_d = {f: cohens_d(tof_seq, f) for f in tof_method_features}
+
+print("ToF summarization method effect sizes (Cohen's d, averaged across 5 sensors, Gesture phase):")
+for f, d in sorted(tof_method_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+
+```
+
+10. Is there a meaningful foreground/background separation in ToF frames that could be computed as a binary mask summary?
+
+```{python}
+#| echo: false
+
+# reuse tof_row from Q9 -- tof_active_count is already "pixels with an object in
+# range" out of 64, averaged across sensors; foreground ratio just rescales it to [0, 1]
+tof_fg_seq = (
+    tof_row
+    .with_columns((pl.col("tof_active_count") / 64.0).alias("fg_ratio"))
+    .group_by("sequence_id", "is_bfrb")
+    .agg(
+        pl.col("fg_ratio").mean().alias("fg_ratio_mean"),
+        pl.col("fg_ratio").std().alias("fg_ratio_std"),
+    )
+)
+
+fg_mean_d = cohens_d(tof_fg_seq, "fg_ratio_mean")
+fg_std_d = cohens_d(tof_fg_seq, "fg_ratio_std")
+
+print(f"Cohen's d, foreground-ratio mean (fraction of pixels with an object in range): {fg_mean_d:.3f}")
+print(f"Cohen's d, foreground-ratio std (within-sequence fluctuation): {fg_std_d:.3f}")
+print(f"For comparison, continuous tof_valid_mean (Q9): d = {tof_method_d['tof_valid_mean']:.3f}")
+
+```
+
+11. Does keeping the 5 ToF sensors separate preserve the sensor-specific spatial gradients identified in EDA, particularly the sharper contrast in tof_3?
+
+```{python}
+#| echo: false
+
+# unlike Q9/Q10 (cross-sensor average), keep each sensor's valid_mean separate here
+per_sensor_cols = {s: f"tof_{s}_valid_mean" for s in tof_sensors}
+
+tof_sensor_row = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .select(
+        [pl.col("sequence_id"), pl.col("is_bfrb")]
+        + [pl.mean_horizontal(valid_exprs(s)).alias(name) for s, name in per_sensor_cols.items()]
+    )
+)
+
+tof_sensor_seq = (
+    tof_sensor_row
+    .group_by("sequence_id", "is_bfrb")
+    .agg([pl.col(name).mean() for name in per_sensor_cols.values()])
+)
+
+per_sensor_d = {name: cohens_d(tof_sensor_seq, name) for name in per_sensor_cols.values()}
+
+print("Per-sensor tof_valid_mean effect sizes (Gesture phase):")
+for f, d in sorted(per_sensor_d.items(), key=lambda kv: abs(kv[1]), reverse=True):
+    print(f"  {f}: d = {d:.3f}")
+print(f"\nFor comparison, cross-sensor averaged tof_valid_mean (Q9): d = {tof_method_d['tof_valid_mean']:.3f}")
+
+best_sensor_name = max(per_sensor_d, key=lambda f: abs(per_sensor_d[f]))
+best_sensor_d = abs(per_sensor_d[best_sensor_name])
+avg_d = abs(tof_method_d["tof_valid_mean"])
+is_tof3_strongest = best_sensor_name == "tof_3_valid_mean"
+
+```
+
+## Modality Ablation Design
+
+12. Can you clearly separate your feature matrix into four named blocks (IMU, thermopile, ToF, and metadata/flags), so you can zero out any block and re-run cleanly? The metadata block should include thm5_present, thm1234_group_missing, is_suspect_subject, handedness, and elbow_to_wrist_cm.
+
+```{python}
+#| echo: false
+
+# --- metadata / flags block ---
+thm5_presence = (
+    train_df.group_by("sequence_id").agg(pl.col("thm_5").is_not_null().any().alias("thm5_present"))
+)
+thm1234_missing = (
+    train_df.group_by("sequence_id").agg(
+        (pl.col("thm_1").is_null() & pl.col("thm_2").is_null()
+         & pl.col("thm_3").is_null() & pl.col("thm_4").is_null()).all().alias("thm1234_group_missing")
+    )
+)
+# subject-level thermopile z-outlier -- catches sensor miscalibration / cold-reading subjects
+subject_thm_level = (
+    train_df
+    .with_columns(pl.mean_horizontal(thm_cols).alias("thm_row_mean"))
+    .group_by("subject")
+    .agg(pl.col("thm_row_mean").mean().alias("subject_thm_mean"))
+    .with_columns(
+        ((pl.col("subject_thm_mean") - pl.col("subject_thm_mean").mean()) / pl.col("subject_thm_mean").std())
+        .alias("subject_thm_z")
+    )
+    .with_columns((pl.col("subject_thm_z").abs() > 2).alias("is_suspect_subject"))
+)
+metadata_seq = (
+    train_df
+    .select("sequence_id", "subject")
+    .unique()
+    .join(thm5_presence, on="sequence_id", how="left")
+    .join(thm1234_missing, on="sequence_id", how="left")
+    .join(subject_thm_level.select("subject", "is_suspect_subject"), on="subject", how="left")
+    .join(demo_df.select("subject", "handedness", "elbow_to_wrist_cm"), on="subject", how="left")
+    .with_columns(
+        pl.col("thm5_present").cast(pl.Float64),
+        pl.col("thm1234_group_missing").cast(pl.Float64),
+        pl.col("is_suspect_subject").cast(pl.Float64),
+        pl.col("handedness").cast(pl.Float64),
+    )
+)
+metadata_block_cols = ["thm5_present", "thm1234_group_missing", "is_suspect_subject", "handedness", "elbow_to_wrist_cm"]
+
+# --- IMU block: Q2 per-axis/jerk stats + Q1 Gesture-phase acc_mag stats + Q4 quaternion-derived + Q6 spectral ---
+imu_features_df = (
+    imu_seq_features
+    .join(
+        phase_wide.select(["sequence_id"] + [c for c in phase_wide.columns if c.endswith("_Gesture")]),
+        on="sequence_id", how="left",
+    )
+    .join(quat_derived.drop("is_bfrb"), on="sequence_id", how="left")
+    .join(spectral_df.select(["sequence_id", "peak_freq", "spectral_entropy"]), on="sequence_id", how="left")
+)
+imu_block_cols = [c for c in imu_features_df.columns if c not in ("sequence_id", "is_bfrb")]
+
+# --- thermopile block: Q7 gradients + Q8 trend/raw/z-normalized ---
+thm_features_df = (
+    thm_gradient_seq
+    .join(trend_seq.select(["sequence_id", "thm_trend"]), on="sequence_id", how="left")
+    .join(
+        seq_level.select(
+            "sequence_id", "thm_mean_raw", "thm_mean_z",
+            pl.col("thm_subj_z_reliable").cast(pl.Float64),
+        ),
+        on="sequence_id", how="left",
+    )
+)
+thm_block_cols = [c for c in thm_features_df.columns if c not in ("sequence_id", "is_bfrb")]
+
+# --- ToF block: Q9 summarization methods + Q10 foreground ratio + Q11 per-sensor ---
+tof_features_df = (
+    tof_seq
+    .join(tof_fg_seq.select(["sequence_id", "fg_ratio_mean", "fg_ratio_std"]), on="sequence_id", how="left")
+    .join(tof_sensor_seq.select(["sequence_id"] + list(per_sensor_cols.values())), on="sequence_id", how="left")
+)
+tof_block_cols = [c for c in tof_features_df.columns if c not in ("sequence_id", "is_bfrb")]
+
+spine = train_df.select("sequence_id", "is_bfrb").unique()
+feature_matrix = (
+    spine
+    .join(imu_features_df.drop("is_bfrb"), on="sequence_id", how="left")
+    .join(thm_features_df.drop("is_bfrb"), on="sequence_id", how="left")
+    .join(tof_features_df.drop("is_bfrb"), on="sequence_id", how="left")
+    .join(metadata_seq.select(["sequence_id"] + metadata_block_cols), on="sequence_id", how="left")
+)
+
+blocks = {
+    "IMU": imu_block_cols,
+    "Thermopile": thm_block_cols,
+    "ToF": tof_block_cols,
+    "Metadata/Flags": metadata_block_cols,
+}
+
+# zero_block lives in src/features.py (not defined here) so 03_modeling.ipynb can
+# import the exact same ablation utility instead of re-implementing it.
+import sys
+sys.path.insert(0, "..")
+from src.features import zero_block
+
+print(f"Feature matrix: {feature_matrix.shape[0]} sequences x {feature_matrix.shape[1] - 2} features")
+for name, cols in blocks.items():
+    print(f"  {name}: {len(cols)} features")
+
+zeroed = zero_block(feature_matrix, blocks["ToF"])
+print(f"\nzero_block() check -- tof_valid_mean after zeroing ToF block: {zeroed.select('tof_valid_mean').head(3).to_series().to_list()}")
+
+```
+
+13. What does feature importance look like when you train a tree model on each block independently, including the metadata/flags block as a standalone run? Strong flag importance suggests sensor degradation patterns are leaking class signal the modality features should be encoding themselves?
+
+```{python}
+#| echo: false
+
+# n_jobs=1 -- joblib's process-based parallelism (n_jobs=-1) crashes under this
+# Windows + Jupyter venv with a BrokenProcessPool/WinError 6, even though the same
+# code runs fine single-threaded. Block-level fits are small enough that this costs
+# little.
+def train_eval_block(X_cols: list[str], block_name: str):
+    pdf = feature_matrix.select(["is_bfrb"] + X_cols).to_pandas()
+    y = pdf["is_bfrb"].astype(int)
+    X = pdf[X_cols].fillna(pdf[X_cols].median())
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    clf = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42, n_jobs=1)
+    clf.fit(X_train, y_train)
+    test_auc = roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1])
+
+    perm = permutation_importance(clf, X_test, y_test, n_repeats=10, random_state=42, n_jobs=1)
+    importance = pd.Series(perm.importances_mean, index=X_cols).sort_values(ascending=False)
+
+    print(f"\n=== {block_name} block ({len(X_cols)} features) -- test AUC: {test_auc:.3f} ===")
+    print("Top 5 features by permutation importance:")
+    for feat, imp in importance.head(5).items():
+        print(f"  {feat}: {imp:.4f}")
+
+    return test_auc, importance
+
+block_results = {}
+for name, cols in blocks.items():
+    block_results[name] = train_eval_block(cols, name)
+
+print("\nBlock summary (test AUC):")
+for name, (auc, _) in sorted(block_results.items(), key=lambda kv: kv[1][0], reverse=True):
+    print(f"  {name}: AUC = {auc:.3f}")
+
+metadata_auc = block_results["Metadata/Flags"][0]
+best_modality_auc = max(block_results[n][0] for n in ["IMU", "Thermopile", "ToF"])
+
+leakage_check_passed = metadata_auc < 0.6
+print(
+    f"\nLeakage check: metadata/flags-only AUC = {metadata_auc:.3f} (chance = 0.500) -- "
+    f"{'PASS' if leakage_check_passed else 'FAIL'}: is_suspect_subject and the other flags "
+    f"{'do not' if leakage_check_passed else 'may'} act as a proxy for the class label."
+)
+
+```
+
+## Feature Dictionary
+
+```{python}
+#| echo: false
+
+def classify_feature(name: str, block: str) -> tuple[str, str]:
+    if block == "Metadata/Flags":
+        stat_map = {
+            "thm5_present": "missingness_flag",
+            "thm1234_group_missing": "missingness_flag",
+            "is_suspect_subject": "outlier_flag",
+            "handedness": "demographic",
+            "elbow_to_wrist_cm": "anthropometric",
+        }
+        return "N/A", stat_map[name]
+
+    phase = (
+        "Gesture"
+        if (block in ("Thermopile", "ToF") or name.endswith("_Gesture") or name in ("peak_freq", "spectral_entropy"))
+        else "Whole-sequence"
+    )
+    base = name[: -len("_Gesture")] if name.endswith("_Gesture") else name
+
+    if base == "length":
+        stat = "count"
+    elif base in ("thm_mean_level", "thm_mean_raw"):
+        stat = "mean"
+    elif base.endswith("_jerk_mean"):
+        stat = "jerk_mean"
+    elif base.endswith("_mean"):
+        stat = "mean"
+    elif base.endswith("_std"):
+        stat = "std"
+    elif base.endswith("_iqr"):
+        stat = "iqr"
+    elif base.endswith("_skew"):
+        stat = "skew"
+    elif base.endswith("_kurtosis"):
+        stat = "kurtosis"
+    elif base.endswith("_entropy") or base == "spectral_entropy":
+        stat = "entropy"
+    elif base.endswith("_range"):
+        stat = "range"
+    elif base.endswith("_median"):
+        stat = "median"
+    elif base.endswith("_min"):
+        stat = "min"
+    elif base.endswith("_max"):
+        stat = "max"
+    elif "grad" in base:
+        stat = "spatial_gradient"
+    elif base == "thm_trend":
+        stat = "temporal_trend"
+    elif base == "thm_mean_z":
+        stat = "z_score"
+    elif base == "thm_subj_z_reliable":
+        stat = "flag"
+    elif "active_count" in base:
+        stat = "count"
+    elif "fg_ratio" in base:
+        stat = "ratio"
+    elif base == "peak_freq":
+        stat = "dominant_frequency"
+    elif "quat_norm" in base:
+        stat = "quaternion_norm"
+    elif "rotation_angle" in base:
+        stat = "rotation_angle"
+    else:
+        stat = "other"
+    return phase, stat
+
+def engineering_note(name: str, block: str, stat: str) -> str:
+    specific = {
+        "rot_x_mean": "Confound-flagged: handedness-mirrored upstream; residual signal remains the strongest mean feature even after correction.",
+        "acc_x_mean": "Handedness-mirrored upstream (see data-loading cell); safe to use as-is.",
+        "thm_grad_45_mean": "thm_5 is heavily missing (482/8151 sequences); null whenever thm_5 is absent for that sequence.",
+        "thm5_present": "Missingness flag for diagnostics/ablation; not a primary predictive feature.",
+        "thm1234_group_missing": "Missingness flag for diagnostics/ablation; not a primary predictive feature.",
+        "is_suspect_subject": "Auxiliary only -- Q13 confirmed the metadata/flags block has no standalone predictive signal (AUC ~ 0.44); do not treat as a leakage-safe shortcut feature.",
+        "handedness": "Raw demographic; acc_x/rot_x are already mirrored using this value upstream, so this is informational, not corrective.",
+        "elbow_to_wrist_cm": "Anthropometric proxy for arm length; untested for class signal on its own.",
+        "thm_mean_z": "Fit with .over('subject') on the full training set in this notebook -- must be refit inside each CV fold during modeling to avoid leakage.",
+        "thm_subj_z_reliable": "Flags sequences whose subject had <3 Gesture-phase sequences, where thm_mean_z fell back to the raw value instead of a z-score.",
+        "tof_active_count": "Counts pixels != -1 (object in range) per row, averaged across the 5 sensors and across rows in the sequence.",
+        "fg_ratio_mean": "tof_active_count rescaled to [0, 1]; same sentinel-aware logic.",
+        "fg_ratio_std": "Within-sequence fluctuation of the foreground ratio.",
+    }
+    if name in specific:
+        return specific[name]
+    if stat == "jerk_mean":
+        return "Mean absolute difference between consecutive samples within a sequence (per-row jerk), not a deviation-from-mean statistic."
+    if block == "ToF" and "valid" in name:
+        return "-1 sentinel ('no object in range') masked to null before aggregating; not treated as a literal distance."
+    if block == "ToF" and "naive" in name:
+        return "Includes -1 sentinel as a literal value; kept only as a baseline contrast to the sentinel-aware tof_valid_* features."
+    if block == "Thermopile" and "grad" in name:
+        return "Adjacent-sensor difference (consecutive index); true physical sensor layout beyond numbering is undocumented."
+    if block == "IMU" and name.endswith("_Gesture"):
+        return "Restricted to the Gesture phase; Q1 found Gesture-phase acc_mag stats outperform whole-sequence and Transition-phase equivalents."
+    return f"{block} {stat} feature; no specific caveat beyond standard sentinel/null handling for this modality."
+
+all_block_cols = (
+    [(c, "IMU") for c in imu_block_cols]
+    + [(c, "Thermopile") for c in thm_block_cols]
+    + [(c, "ToF") for c in tof_block_cols]
+    + [(c, "Metadata/Flags") for c in metadata_block_cols]
+)
+
+rows = []
+for name, block in all_block_cols:
+    phase, stat = classify_feature(name, block)
+    d = cohens_d(feature_matrix, name)
+    rows.append({
+        "feature_name": name,
+        "block": block,
+        "phase": phase,
+        "statistic": stat,
+        "engineering_note": engineering_note(name, block, stat),
+        "cohen_d": round(d, 4),
+    })
+
+feature_dictionary = pd.DataFrame(rows).sort_values(["block", "feature_name"]).reset_index(drop=True)
+feature_dictionary.to_csv("../reports/feature_dictionary.csv", index=False)
+
+print(f"Wrote {len(feature_dictionary)} rows to reports/feature_dictionary.csv")
+print(f"Columns: {list(feature_dictionary.columns)}")
+print(feature_dictionary["block"].value_counts())
+```
+
+## Leakage Notes
+
+Before this feature set is used for modeling, the following must hold:
+
+- **Subject z-scores must be fit inside folds.** `thm_mean_z` (Q8) is computed with
+  `.over("subject")` on the full training set in this notebook, which is fine for
+  exploratory effect-size comparisons but not for modeling. In `03_modeling.ipynb`,
+  the per-subject mean/std used for z-normalization must be refit separately inside
+  each cross-validation fold, using only that fold's training subjects -- otherwise
+  validation sequences leak their own statistics into their own normalized features.
+- **`adult_child` is excluded as a feature.** It was used only as an analysis split
+  in Q8, to test whether the benefit of subject z-normalization differs by age
+  group. It is not a column in `feature_matrix` and should not be added as a model
+  feature without a separate justification.
+- **`is_suspect_subject` is auxiliary only.** Q13's leakage check confirmed the
+  metadata/flags block (including this feature) has no standalone predictive signal
+  (AUC ~ 0.45, chance level). Keep it for diagnostics/ablation, not as a feature the
+  model should rely on for performance.

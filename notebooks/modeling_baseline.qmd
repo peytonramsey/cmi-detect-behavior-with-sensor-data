@@ -1,0 +1,516 @@
+---
+title: "Modeling Baseline 03"
+jupyter: cmi-venv
+---
+
+```{python}
+#| echo: false
+
+import numpy as np
+import pandas as pd
+import polars as pl
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+
+train_df = pl.read_csv("../data/train.csv")
+
+# acc_x/rot_x sign is handedness-dependent; mirror left-handed (handedness == 0)
+# subjects before any IMU feature below uses these axes -- same fix as
+# feature_engineering.qmd, re-applied here since this notebook loads its own
+# train_df rather than inheriting kernel state across separate .qmd files
+demo_df = pl.read_csv("../data/train_demographics.csv")
+train_df = train_df.join(demo_df.select("subject", "handedness"), on="subject", how="left")
+train_df = train_df.with_columns([
+    pl.when(pl.col("handedness") == 0).then(-pl.col("acc_x")).otherwise(pl.col("acc_x")).alias("acc_x"),
+    pl.when(pl.col("handedness") == 0).then(-pl.col("rot_x")).otherwise(pl.col("rot_x")).alias("rot_x"),
+])
+mirror_check = train_df.group_by("handedness").agg(pl.col("acc_x").mean().alias("acc_x_mean")).sort("handedness")
+gap_after_mirror = (
+    mirror_check.filter(pl.col("handedness") == 1).select("acc_x_mean").item()
+    - mirror_check.filter(pl.col("handedness") == 0).select("acc_x_mean").item()
+)
+assert abs(gap_after_mirror) < 0.5, (
+    f"acc_x mirroring failed: handedness groups still {gap_after_mirror:.2f} apart"
+)
+
+# the unit of prediction is a sequence (one gesture attempt), not a raw sensor
+# row, so CV splitting and class-balance checks happen at the sequence_id level
+seq_df = (
+    train_df
+    .select("sequence_id", "subject", "gesture")
+    .unique()
+    .sort("sequence_id")
+)
+
+print(f"{seq_df.height} sequences, {seq_df['subject'].n_unique()} subjects, {seq_df['gesture'].n_unique()} gesture classes")
+print(f"Handedness mirroring applied to acc_x/rot_x (post-mirror acc_x_mean gap: {gap_after_mirror:.3f}).")
+```
+
+# questions to answer
+
+## Validation
+
+1. Are you using subject-aware cross-validation (no subject leaking across train/validation folds)?
+
+```{python}
+#| echo: false
+
+N_SPLITS = 5
+seq_pd = seq_df.to_pandas()
+
+gkf = GroupKFold(n_splits=N_SPLITS)
+splits = list(gkf.split(seq_pd, groups=seq_pd["subject"]))
+
+leaked_folds = []
+for fold, (train_idx, val_idx) in enumerate(splits):
+    train_subjects = set(seq_pd.loc[train_idx, "subject"])
+    val_subjects = set(seq_pd.loc[val_idx, "subject"])
+    overlap = train_subjects & val_subjects
+    if overlap:
+        leaked_folds.append(fold)
+    print(f"Fold {fold}: {len(train_subjects)} train subjects, {len(val_subjects)} val subjects, overlap = {len(overlap)}")
+
+no_leakage = len(leaked_folds) == 0
+print(f"\nSubject leakage check across all {N_SPLITS} folds: {'PASS' if no_leakage else 'FAIL'} ({len(leaked_folds)} fold(s) with overlap)")
+
+```
+
+2. Does stratifying folds by gesture label maintain reasonable class balance within each fold?
+
+```{python}
+#| echo: false
+
+overall_dist = seq_pd["gesture"].value_counts(normalize=True)
+
+fold_rows = []
+for fold, (_, val_idx) in enumerate(splits):
+    val_dist = (
+        seq_pd.loc[val_idx, "gesture"]
+        .value_counts(normalize=True)
+        .reindex(overall_dist.index, fill_value=0.0)
+    )
+    for gesture, prop in val_dist.items():
+        fold_rows.append({
+            "fold": fold,
+            "gesture": gesture,
+            "val_prop": prop,
+            "overall_prop": overall_dist[gesture],
+        })
+
+balance_df = pd.DataFrame(fold_rows)
+balance_df["abs_dev"] = (balance_df["val_prop"] - balance_df["overall_prop"]).abs()
+balance_df["is_missing"] = balance_df["val_prop"] == 0
+
+max_dev_per_fold = balance_df.groupby("fold")["abs_dev"].max()
+missing_per_fold = balance_df.groupby("fold")["is_missing"].sum()
+
+print("Max |val_prop - overall_prop| per fold:")
+print(max_dev_per_fold.round(3).to_string())
+print(f"\nGesture/fold combinations missing entirely from a validation fold: {int(missing_per_fold.sum())} (across {N_SPLITS} folds)")
+
+```
+
+3. What is the macro F1 score for a majority-class baseline? How much better does any real model need to be to be meaningful?
+
+```{python}
+#| echo: false
+
+# reuse the Q1 GroupKFold splits so the baseline is directly comparable to any
+# real model's CV score later -- majority class is taken from each fold's train
+# side only, never the full dataset, to avoid leaking validation composition in
+baseline_f1_per_fold = []
+for fold, (train_idx, val_idx) in enumerate(splits):
+    train_gesture = seq_pd.loc[train_idx, "gesture"]
+    val_gesture = seq_pd.loc[val_idx, "gesture"]
+    majority_class = train_gesture.value_counts().idxmax()
+    preds = [majority_class] * len(val_gesture)
+    fold_f1 = f1_score(val_gesture, preds, average="macro", zero_division=0)
+    baseline_f1_per_fold.append(fold_f1)
+    print(f"Fold {fold}: majority class = {majority_class!r}, macro F1 = {fold_f1:.4f}")
+
+baseline_macro_f1 = float(np.mean(baseline_f1_per_fold))
+
+print(f"\nMean majority-class baseline macro F1 across {N_SPLITS} folds: {baseline_macro_f1:.4f}")
+
+```
+
+## Baseline Models
+
+4. What macro F1 does logistic regression achieve on IMU-only statistical features, what is the interpretable floor?
+
+```{python}
+#| echo: false
+
+imu_channels = ["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]
+
+imu_feature_df = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .with_columns(pl.mean_horizontal([pl.col(c).abs() for c in ["acc_x", "acc_y", "acc_z"]]).alias("acc_mag"))
+    .group_by("sequence_id")
+    .agg([
+        expr
+        for c in imu_channels + ["acc_mag"]
+        for expr in (
+            pl.col(c).mean().alias(f"{c}_mean"),
+            pl.col(c).std().alias(f"{c}_std"),
+            pl.col(c).min().alias(f"{c}_min"),
+            pl.col(c).max().alias(f"{c}_max"),
+        )
+    ])
+)
+imu_feature_cols = [c for c in imu_feature_df.columns if c != "sequence_id"]
+
+# left-join onto seq_pd's sequence_id (not the reverse) so row order stays
+# aligned with the GroupKFold split indices computed against seq_pd in Q1
+imu_pd = seq_pd[["sequence_id"]].merge(imu_feature_df.to_pandas(), on="sequence_id", how="left")
+X_imu = imu_pd[imu_feature_cols].fillna(imu_pd[imu_feature_cols].median())
+y = seq_pd["gesture"]
+
+
+def cv_eval(estimator, X, y, splits, scale=False):
+    """Fit/score `estimator` across the Q1 GroupKFold splits; returns per-fold macro F1."""
+    fold_f1 = []
+    for train_idx, val_idx in splits:
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        if scale:
+            scaler = StandardScaler().fit(X_train)
+            X_train = scaler.transform(X_train)
+            X_val = scaler.transform(X_val)
+        estimator.fit(X_train, y_train)
+        preds = estimator.predict(X_val)
+        fold_f1.append(f1_score(y_val, preds, average="macro", zero_division=0))
+    return fold_f1
+
+
+logreg_f1 = cv_eval(LogisticRegression(max_iter=2000, random_state=42), X_imu, y, splits, scale=True)
+logreg_macro_f1 = float(np.mean(logreg_f1))
+
+print(f"IMU feature matrix: {X_imu.shape[0]} sequences x {X_imu.shape[1]} features")
+print(f"Logistic regression macro F1 per fold: {[round(f, 4) for f in logreg_f1]}")
+print(f"Mean: {logreg_macro_f1:.4f} (majority-class baseline from Q3: {baseline_macro_f1:.4f})")
+
+```
+
+5. Does a Random Forest meaningfully outperform logistic regression, and which features does it rank as most important?
+
+```{python}
+#| echo: false
+
+rf_clf = RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1)
+rf_f1 = cv_eval(rf_clf, X_imu, y, splits, scale=False)
+rf_macro_f1 = float(np.mean(rf_f1))
+
+print(f"Random Forest macro F1 per fold: {[round(f, 4) for f in rf_f1]}")
+print(f"Mean: {rf_macro_f1:.4f} (logistic regression from Q4: {logreg_macro_f1:.4f})")
+
+# fit once on fold 0's train split for feature importance only -- this fit is
+# not reused for scoring, so it doesn't affect the CV numbers above
+train_idx, val_idx = splits[0]
+rf_importance_clf = RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1)
+rf_importance_clf.fit(X_imu.iloc[train_idx], y.iloc[train_idx])
+perm_result = permutation_importance(
+    rf_importance_clf, X_imu.iloc[val_idx], y.iloc[val_idx],
+    scoring="f1_macro", n_repeats=10, random_state=42, n_jobs=1,
+)
+importance_ranking = pd.Series(perm_result.importances_mean, index=X_imu.columns).sort_values(ascending=False)
+
+print("\nTop 10 features by permutation importance (fold 0 validation):")
+print(importance_ranking.head(10).round(4).to_string())
+
+```
+
+6. Is XGBoost consistently better than Random Forest, or only marginally, is the complexity worth it at this stage?
+
+```{python}
+#| echo: false
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+if HAS_XGB:
+    from sklearn.preprocessing import LabelEncoder
+
+    label_encoder = LabelEncoder().fit(y)
+    y_enc = pd.Series(label_encoder.transform(y), index=y.index)
+
+    xgb_clf = XGBClassifier(
+        n_estimators=300, max_depth=6, learning_rate=0.1,
+        objective="multi:softprob", num_class=len(label_encoder.classes_),
+        random_state=42, n_jobs=1, eval_metric="mlogloss",
+    )
+    xgb_f1 = cv_eval(xgb_clf, X_imu, y_enc, splits, scale=False)
+    xgb_macro_f1 = float(np.mean(xgb_f1))
+
+    print(f"XGBoost macro F1 per fold: {[round(f, 4) for f in xgb_f1]}")
+    print(f"Mean: {xgb_macro_f1:.4f} (Random Forest from Q5: {rf_macro_f1:.4f})")
+
+else:
+    print("xgboost is not installed in this environment -- run `pip install xgboost` in cmi-venv to enable this comparison.")
+```
+
+## Error Analysis
+
+7. Which gesture pairs are most frequently confused, is there a pattern (e.g. similar body part, similar motion amplitude)?
+
+```{python}
+#| echo: false
+
+# error analysis uses whichever of the two unconditionally-available baseline
+# models (Q4/Q5) scored higher -- XGBoost is left out of this pick since it's an
+# optional dependency (Q6) that may not be installed
+best_model_name = "Random Forest" if rf_macro_f1 >= logreg_macro_f1 else "Logistic Regression"
+
+
+def cv_predict(estimator, X, y, splits, scale=False):
+    """OOF predictions across the Q1 GroupKFold splits, aligned to X's row order."""
+    oof = np.empty(len(X), dtype=object)
+    for train_idx, val_idx in splits:
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train = y.iloc[train_idx]
+        if scale:
+            scaler = StandardScaler().fit(X_train)
+            X_train = scaler.transform(X_train)
+            X_val = scaler.transform(X_val)
+        estimator.fit(X_train, y_train)
+        oof[val_idx] = estimator.predict(X_val)
+    return oof
+
+
+if best_model_name == "Random Forest":
+    oof_preds = cv_predict(
+        RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1),
+        X_imu, y, splits, scale=False,
+    )
+else:
+    oof_preds = cv_predict(LogisticRegression(max_iter=2000, random_state=42), X_imu, y, splits, scale=True)
+
+oof_macro_f1 = f1_score(y, oof_preds, average="macro", zero_division=0)
+
+# whichever model scored highest overall (Q4-6), for comparison against the
+# error-analysis model picked above -- they can differ, since XGBoost (Q6) is
+# excluded from that pick whenever it isn't installed
+overall_scores = {"Logistic Regression": logreg_macro_f1, "Random Forest": rf_macro_f1}
+if HAS_XGB:
+    overall_scores["XGBoost"] = xgb_macro_f1
+best_overall_name = max(overall_scores, key=overall_scores.get)
+best_overall_f1 = overall_scores[best_overall_name]
+
+gesture_labels = sorted(y.unique())
+cm = confusion_matrix(y, oof_preds, labels=gesture_labels)
+
+confused_pairs = []
+for i, true_label in enumerate(gesture_labels):
+    for j, pred_label in enumerate(gesture_labels):
+        if i != j and cm[i, j] > 0:
+            confused_pairs.append((true_label, pred_label, cm[i, j]))
+confused_pairs.sort(key=lambda triple: triple[2], reverse=True)
+top_confused = confused_pairs[:10]
+
+print(f"Error-analysis model: {best_model_name} (OOF macro F1 = {oof_macro_f1:.4f})")
+if best_overall_name != best_model_name:
+    print(
+        f"Note: {best_overall_name} scored higher overall ({best_overall_f1:.4f}) but is "
+        f"excluded from this pick -- see the comment above. Errors below are {best_model_name}'s."
+    )
+print("\nTop confused gesture pairs (true -> predicted, count):")
+for true_label, pred_label, count in top_confused:
+    print(f"  {true_label!r} -> {pred_label!r}: {count}")
+
+```
+
+8. Are errors concentrated in specific subjects, or spread evenly, does subject-level variance dominate model error?
+
+```{python}
+#| echo: false
+
+errors = (oof_preds != y.to_numpy()).astype(int)
+error_pd = pd.DataFrame({"subject": seq_pd["subject"], "error": errors})
+
+subject_stats = error_pd.groupby("subject")["error"].agg(["mean", "count"]).rename(columns={"mean": "error_rate"})
+grand_mean = error_pd["error"].mean()
+
+# eta-squared: share of total error variance explained by which subject it is
+# (one-way ANOVA variance decomposition, grouping by subject)
+ss_between = (subject_stats["count"] * (subject_stats["error_rate"] - grand_mean) ** 2).sum()
+ss_total = ((error_pd["error"] - grand_mean) ** 2).sum()
+eta_squared = ss_between / ss_total
+
+worst_subjects = subject_stats.sort_values("error_rate", ascending=False).head(5)
+worst_subject_id = worst_subjects.index[0]
+worst_subject_rate = worst_subjects["error_rate"].iloc[0]
+
+print(f"Overall error rate: {grand_mean:.3f}")
+print(
+    f"Per-subject error rate: min={subject_stats['error_rate'].min():.3f}, "
+    f"max={subject_stats['error_rate'].max():.3f}, std={subject_stats['error_rate'].std():.3f}"
+)
+print("\nWorst 5 subjects by error rate:")
+print(worst_subjects.round(3).to_string())
+print(f"\nShare of total error variance explained by subject identity (eta^2): {eta_squared:.3f}")
+
+```
+
+9. Does model performance degrade substantially on sequences shorter than average, is sequence length a confound?
+
+```{python}
+#| echo: false
+
+seq_length = train_df.group_by("sequence_id").agg(pl.len().alias("seq_length"))
+length_pd = seq_pd[["sequence_id"]].merge(seq_length.to_pandas(), on="sequence_id", how="left")
+length_pd["error"] = errors
+
+avg_length = length_pd["seq_length"].mean()
+short_mask = length_pd["seq_length"] < avg_length
+
+short_error_rate = length_pd.loc[short_mask, "error"].mean()
+normal_error_rate = length_pd.loc[~short_mask, "error"].mean()
+length_error_corr = length_pd["seq_length"].corr(length_pd["error"])
+
+print(f"Average sequence length: {avg_length:.1f} rows ({short_mask.sum()} of {len(length_pd)} sequences below average)")
+print(f"Error rate -- below-average length: {short_error_rate:.3f}, at-or-above average: {normal_error_rate:.3f}")
+print(f"Correlation between sequence length and error: {length_error_corr:.3f}")
+
+```
+
+## IMU-Only vs. Full-Sensor
+
+10. What is the macro F1 gap between the IMU-only model and the full-feature model on held-out sequences with full sensor data?
+
+```{python}
+#| echo: false
+
+thm_cols = [f"thm_{i}" for i in range(1, 6)]
+tof_sensors = [1, 2, 3, 4, 5]
+
+
+def pixel_cols(sensor):
+    return [f"tof_{sensor}_v{i}" for i in range(64)]
+
+
+def valid_exprs(sensor):
+    return [pl.when(pl.col(c) == -1).then(None).otherwise(pl.col(c)) for c in pixel_cols(sensor)]
+
+
+# --- thermopile block: level + cross-sensor spatial gradients (Gesture phase) ---
+thm_feature_df = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .with_columns(pl.mean_horizontal(thm_cols).alias("thm_row_mean"))
+    .group_by("sequence_id")
+    .agg(
+        pl.col("thm_row_mean").mean().alias("thm_mean"),
+        pl.col("thm_row_mean").std().alias("thm_std"),
+        (pl.col("thm_1") - pl.col("thm_2")).mean().alias("thm_grad_12_mean"),
+        (pl.col("thm_2") - pl.col("thm_3")).mean().alias("thm_grad_23_mean"),
+        (pl.col("thm_3") - pl.col("thm_4")).mean().alias("thm_grad_34_mean"),
+        (pl.col("thm_4") - pl.col("thm_5")).mean().alias("thm_grad_45_mean"),
+    )
+)
+thm_feature_cols = [c for c in thm_feature_df.columns if c != "sequence_id"]
+
+# --- ToF block: per-sensor valid_mean, -1 sentinel masked to null before averaging (Gesture phase) ---
+tof_feature_df = (
+    train_df
+    .filter(pl.col("phase") == "Gesture")
+    .with_columns([pl.mean_horizontal(valid_exprs(s)).alias(f"tof_{s}_valid_mean") for s in tof_sensors])
+    .group_by("sequence_id")
+    .agg([pl.col(f"tof_{s}_valid_mean").mean().alias(f"tof_{s}_valid_mean") for s in tof_sensors])
+)
+tof_feature_cols = [c for c in tof_feature_df.columns if c != "sequence_id"]
+
+# --- sequence-level sensor-presence flags: does this sequence have thermopile/ToF
+# data at all (vs an IMU-only sequence), checked across the whole sequence, not
+# just the Gesture phase ---
+sensor_presence = (
+    train_df
+    .group_by("sequence_id")
+    .agg(
+        pl.mean_horizontal(thm_cols).is_not_null().any().alias("has_thm"),
+        pl.any_horizontal([pl.col(f"tof_{s}_v0").is_not_null().any() for s in tof_sensors]).alias("has_tof"),
+    )
+    .to_pandas()
+)
+
+# combine all blocks onto seq_pd's row order -- same alignment invariant as Q4
+full_pd = (
+    seq_pd[["sequence_id"]]
+    .merge(imu_feature_df.to_pandas(), on="sequence_id", how="left")
+    .merge(thm_feature_df.to_pandas(), on="sequence_id", how="left")
+    .merge(tof_feature_df.to_pandas(), on="sequence_id", how="left")
+    .merge(sensor_presence, on="sequence_id", how="left")
+)
+full_sensor_mask = (full_pd["has_thm"] & full_pd["has_tof"]).to_numpy()
+y_arr = y.to_numpy()
+
+full_feature_cols = imu_feature_cols + thm_feature_cols + tof_feature_cols
+X_full = full_pd[full_feature_cols].fillna(full_pd[full_feature_cols].median())
+
+# same model class as the IMU-only OOF predictions from Q7, for an apples-to-apples comparison
+if best_model_name == "Random Forest":
+    oof_preds_full = cv_predict(
+        RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1),
+        X_full, y, splits, scale=False,
+    )
+else:
+    oof_preds_full = cv_predict(LogisticRegression(max_iter=2000, random_state=42), X_full, y, splits, scale=True)
+
+imu_only_f1_full_sensor = f1_score(
+    y_arr[full_sensor_mask], oof_preds[full_sensor_mask], average="macro", zero_division=0
+)
+full_feature_f1_full_sensor = f1_score(
+    y_arr[full_sensor_mask], oof_preds_full[full_sensor_mask], average="macro", zero_division=0
+)
+macro_f1_gap = full_feature_f1_full_sensor - imu_only_f1_full_sensor
+
+print(f"Held-out sequences with full sensor data: {full_sensor_mask.sum()} of {len(full_sensor_mask)}")
+print(f"IMU-only macro F1 (full-sensor subset): {imu_only_f1_full_sensor:.4f}")
+print(f"Full-feature (IMU+Thermopile+ToF) macro F1 (full-sensor subset): {full_feature_f1_full_sensor:.4f}")
+print(f"Gap: {macro_f1_gap:+.4f}")
+
+
+```
+
+11. Is the thermopile or ToF modality contributing more of that gap, which modality is more valuable?
+
+```{python}
+#| echo: false
+
+X_imu_thm = full_pd[imu_feature_cols + thm_feature_cols]
+X_imu_thm = X_imu_thm.fillna(X_imu_thm.median())
+X_imu_tof = full_pd[imu_feature_cols + tof_feature_cols]
+X_imu_tof = X_imu_tof.fillna(X_imu_tof.median())
+
+if best_model_name == "Random Forest":
+    oof_preds_imu_thm = cv_predict(
+        RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1),
+        X_imu_thm, y, splits, scale=False,
+    )
+    oof_preds_imu_tof = cv_predict(
+        RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=1),
+        X_imu_tof, y, splits, scale=False,
+    )
+else:
+    oof_preds_imu_thm = cv_predict(LogisticRegression(max_iter=2000, random_state=42), X_imu_thm, y, splits, scale=True)
+    oof_preds_imu_tof = cv_predict(LogisticRegression(max_iter=2000, random_state=42), X_imu_tof, y, splits, scale=True)
+
+imu_thm_f1 = f1_score(y_arr[full_sensor_mask], oof_preds_imu_thm[full_sensor_mask], average="macro", zero_division=0)
+imu_tof_f1 = f1_score(y_arr[full_sensor_mask], oof_preds_imu_tof[full_sensor_mask], average="macro", zero_division=0)
+
+thm_lift = imu_thm_f1 - imu_only_f1_full_sensor
+tof_lift = imu_tof_f1 - imu_only_f1_full_sensor
+
+print(f"IMU-only macro F1 (full-sensor subset): {imu_only_f1_full_sensor:.4f}")
+print(f"IMU + Thermopile macro F1: {imu_thm_f1:.4f} (lift: {thm_lift:+.4f})")
+print(f"IMU + ToF macro F1: {imu_tof_f1:.4f} (lift: {tof_lift:+.4f})")
+print(f"Full-feature macro F1 from Q10: {full_feature_f1_full_sensor:.4f} (lift: {macro_f1_gap:+.4f})")
+
+```

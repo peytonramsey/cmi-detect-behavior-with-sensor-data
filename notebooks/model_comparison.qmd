@@ -1,0 +1,910 @@
+---
+title: "Model Comparison: BFRB Gesture Classification"
+jupyter: cmi-venv
+---
+
+This notebook compares four model families on the CMI BFRB wrist-sensor dataset (8,151 sequences, 18 gesture classes, ~35 subjects): sequence models (1D-CNN, GRU, LSTM) on raw IMU time-series; Random Forest on engineered features from three sensor groups (IMU, thermopile, ToF); three missing-modality strategies for sequences without thermopile/ToF; and ensemble and post-processing techniques applied to existing model outputs. All cross-validation uses `GroupKFold(n_splits=5)` grouped by subject. Deep-learning models use 3 of 5 folds to limit CPU training time; DL estimates carry wider fold-to-fold variance than the 5-fold RF results and should be read as coarse comparisons rather than precise rankings.
+
+## Setup and data recap
+
+```{python}
+#| echo: false
+
+import numpy as np
+import pandas as pd
+import polars as pl
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import f1_score
+from sklearn.preprocessing import LabelEncoder
+
+train_df = pl.read_csv("../data/train.csv")
+demo_df  = pl.read_csv("../data/train_demographics.csv")
+train_df = train_df.join(demo_df.select("subject", "handedness"), on="subject", how="left")
+train_df = train_df.with_columns([
+    pl.when(pl.col("handedness") == 0).then(-pl.col("acc_x")).otherwise(pl.col("acc_x")).alias("acc_x"),
+    pl.when(pl.col("handedness") == 0).then(-pl.col("rot_x")).otherwise(pl.col("rot_x")).alias("rot_x"),
+])
+
+seq_df = train_df.select("sequence_id", "subject", "gesture").unique().sort("sequence_id")
+seq_pd = seq_df.to_pandas()
+
+N_SPLITS = 5
+N_DL_SPLITS = 3   # DL folds capped at 3 to limit CPU training time
+gkf = GroupKFold(n_splits=N_SPLITS)
+splits = list(gkf.split(seq_pd, groups=seq_pd["subject"]))
+
+le = LabelEncoder().fit(seq_pd["gesture"])
+y_enc = le.transform(seq_pd["gesture"])   # int array aligned to seq_pd row order
+
+# fixed reference from modeling_baseline Q6 (same CV structure, reproducible)
+XGB_BASELINE_F1 = 0.5241
+
+print(f"{seq_df.height} sequences, {seq_pd['subject'].nunique()} subjects, {le.classes_.shape[0]} classes")
+print(f"Handedness mirroring applied.")
+```
+
+```{python}
+#| echo: false
+#| cache: true
+
+IMU_CHANNELS = ["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]
+N_CHANNELS = len(IMU_CHANNELS)
+N_SEQS = len(seq_pd)
+sid_to_idx = {sid: i for i, sid in enumerate(seq_pd["sequence_id"])}
+
+# sensor-presence flags for Q3
+thm_cols = [f"thm_{i}" for i in range(1, 6)]
+tof_v0 = [f"tof_{s}_v0" for s in range(1, 6)]
+presence = (
+    train_df.group_by("sequence_id").agg(
+        pl.mean_horizontal(thm_cols).is_not_null().any().alias("has_thm"),
+        pl.any_horizontal([pl.col(c).is_not_null().any() for c in tof_v0]).alias("has_tof"),
+    ).to_pandas()
+)
+presence_pd = seq_pd[["sequence_id"]].merge(presence, on="sequence_id", how="left")
+full_sensor_mask = (presence_pd["has_thm"] & presence_pd["has_tof"]).to_numpy()
+imu_only_mask = ~full_sensor_mask
+
+
+def build_padded_tensor(phase_filter=None):
+    """Return (X, max_len) where X is (N_SEQS, max_len, N_CHANNELS) float32.
+    max_len is capped at the 95th-percentile sequence length to limit wasted padding."""
+    df = train_df.sort("sequence_id", "sequence_counter").select(
+        ["sequence_id", "sequence_counter", "phase"] + IMU_CHANNELS
+    )
+    if phase_filter:
+        df = df.filter(pl.col("phase").is_in(phase_filter))
+
+    lengths_df = df.group_by("sequence_id").agg(pl.len().alias("n")).to_pandas()
+    lengths = (
+        seq_pd[["sequence_id"]].merge(lengths_df, on="sequence_id", how="left")["n"]
+        .fillna(0).astype(int).values
+    )
+    max_len = int(np.percentile(lengths[lengths > 0], 95))
+    X = np.zeros((N_SEQS, max_len, N_CHANNELS), dtype=np.float32)
+
+    df_pd = df.to_pandas()
+    df_pd["_row_idx"] = df_pd["sequence_id"].map(sid_to_idx)
+    df_pd = df_pd.dropna(subset=["_row_idx"])
+    df_pd["_row_idx"] = df_pd["_row_idx"].astype(int)
+    df_pd = df_pd.sort_values(["_row_idx", "sequence_counter"])
+    grp_counts = df_pd.groupby("_row_idx", sort=False).cumcount().values
+    mask = grp_counts < max_len
+    row_idxs = df_pd["_row_idx"].values[mask]
+    col_idxs = grp_counts[mask]
+    vals = df_pd[IMU_CHANNELS].values[mask].astype(np.float32)
+    nan_count = int(np.isnan(vals).sum())
+    if nan_count:
+        print(f"  [build_padded_tensor] {nan_count} NaN sensor readings replaced with 0")
+        vals = np.nan_to_num(vals, nan=0.0)
+    X[row_idxs, col_idxs] = vals
+
+    return X, max_len
+
+
+X_gesture, MAX_LEN_G = build_padded_tensor(phase_filter=["Gesture"])
+X_full_seq, MAX_LEN_F = build_padded_tensor(phase_filter=None)
+
+print(f"Gesture-phase tensor: {X_gesture.shape} (max {MAX_LEN_G} timesteps)")
+print(f"Full-sequence tensor: {X_full_seq.shape} (max {MAX_LEN_F} timesteps)")
+print(f"Full-sensor sequences: {full_sensor_mask.sum()} / {N_SEQS}")
+print(f"IMU-only  sequences: {imu_only_mask.sum()} / {N_SEQS}")
+```
+
+```{python}
+#| echo: false
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"PyTorch {torch.__version__} available, device: {DEVICE}")
+
+class CNN1D(nn.Module):
+    """Two-layer 1D-CNN with global average pooling."""
+    def __init__(self, n_channels, n_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(n_channels, 64, kernel_size=5, padding=2), nn.ReLU(), nn.BatchNorm1d(64),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2), nn.ReLU(), nn.BatchNorm1d(128),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(),
+            nn.Dropout(0.3), nn.Linear(128, n_classes),
+        )
+    def forward(self, x):
+        return self.net(x.permute(0, 2, 1))
+
+class RNNModel(nn.Module):
+    """Bidirectional single-layer GRU or LSTM."""
+    def __init__(self, n_channels, n_classes, hidden=64, rnn_type="gru"):
+        super().__init__()
+        rnn_cls = nn.GRU if rnn_type == "gru" else nn.LSTM
+        self.rnn = rnn_cls(n_channels, hidden, num_layers=1,
+                           batch_first=True, bidirectional=True)
+        self.head = nn.Sequential(nn.Dropout(0.3), nn.Linear(hidden * 2, n_classes))
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        # Mask out padding positions (all-zero after _normalize) before mean pooling.
+        lengths = (x != 0).any(dim=-1).sum(dim=1).clamp(min=1)
+        mask = torch.arange(x.size(1), device=x.device) < lengths[:, None]
+        out_m = out * mask.unsqueeze(-1)
+        return self.head(out_m.sum(dim=1) / lengths.unsqueeze(-1).float())
+
+def _normalize(X_train, X_val):
+    """Per-channel z-score; padding timesteps (all-zero rows) stay zero after normalization."""
+    flat = X_train.reshape(-1, X_train.shape[-1])
+    nonzero = flat.any(axis=1)
+    mu = flat[nonzero].mean(axis=0, keepdims=True)
+    sig = flat[nonzero].std(axis=0,  keepdims=True) + 1e-8
+    pad_tr = ~(X_train != 0).any(axis=-1, keepdims=True)
+    pad_vl = ~(X_val != 0).any(axis=-1, keepdims=True)
+    X_tr_n = np.where(pad_tr, 0.0, (X_train - mu) / sig)
+    X_vl_n = np.where(pad_vl, 0.0, (X_val - mu) / sig)
+    return X_tr_n.astype(np.float32), X_vl_n.astype(np.float32)
+
+def cv_eval_dl(model_fn, X, y_int, splits, n_epochs=10, batch_size=64, lr=1e-3):
+    """Train/score a PyTorch model factory across GroupKFold splits.
+    Returns (fold_macro_f1_list, oof_predictions_array)."""
+    oof = np.zeros(len(X), dtype=np.int64)
+    f1s = []
+    for fold, (tr, vl) in enumerate(splits):
+        model = model_fn().to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        X_tr, X_vl = _normalize(X[tr], X[vl])
+        loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X_tr, device=DEVICE),
+                torch.tensor(y_int[tr], dtype=torch.long, device=DEVICE),
+            ),
+            batch_size=batch_size, shuffle=True,
+        )
+
+        if np.isnan(X_tr).any():
+            print(f"  Fold {fold}: WARNING: NaN in X_tr; check build_padded_tensor")
+            continue
+
+        model.train()
+        for _ in range(n_epochs):
+            for xb, yb in loader:
+                optimizer.zero_grad()
+                criterion(model(xb), yb).backward()
+                optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            preds = model(torch.tensor(X_vl, device=DEVICE)).argmax(1).cpu().numpy()
+        oof[vl] = preds
+        fold_f1 = f1_score(y_int[vl], preds, average="macro", zero_division=0)
+        f1s.append(fold_f1)
+        print(f"  Fold {fold}: {fold_f1:.4f}")
+    return f1s, oof
+```
+
+## Model selection: CNN vs. engineered-feature tree vs. sequence models
+
+Baseline reference: XGBoost on engineered features (IMU + thermopile + ToF, `modeling_baseline` Q6, 5-fold GroupKFold) = **0.5241** macro F1.
+
+### Q1: Does a 1D-CNN on raw IMU time-series outperform the engineered-feature tree model?
+
+```{python}
+#| echo: false
+#| cache: true
+# cache-v2 (busts cache after _normalize padding fix)
+
+print("Training 1D-CNN on Gesture-phase raw IMU (7 channels)...")
+cnn_f1, cnn_oof = cv_eval_dl(
+    lambda: CNN1D(N_CHANNELS, len(le.classes_)),
+    X_gesture, y_enc, splits[:N_DL_SPLITS],
+)
+cnn_macro_f1 = float(np.mean(cnn_f1))
+cnn_vs_xgb   = cnn_macro_f1 - XGB_BASELINE_F1
+
+print(f"\n1D-CNN mean macro F1 : {cnn_macro_f1:.4f}")
+print(f"Fold F1              : {', '.join(f'{f:.4f}' for f in cnn_f1)}  ({N_DL_SPLITS}/{N_SPLITS} folds)")
+print(f"XGBoost (engineered) : {XGB_BASELINE_F1:.4f}  (modeling_baseline Q6, 5 folds)")
+print(f"Gap                  : {cnn_vs_xgb:+.4f}")
+
+```
+
+### Q2: Do GRU/LSTM sequence models better capture Transition-Pause-Gesture structure than a CNN?
+
+```{python}
+#| echo: false
+#| cache: true
+# cache-v2 (busts cache after _normalize padding fix + RNN masked mean)
+
+# Use the full three-phase sequence so recurrent models can actually exploit
+# the Transition -> Pause -> Gesture temporal ordering, not just the Gesture phase
+print("Training GRU on full TPG sequence (all 3 phases)...")
+gru_f1, gru_oof = cv_eval_dl(
+    lambda: RNNModel(N_CHANNELS, len(le.classes_), rnn_type="gru"),
+    X_full_seq, y_enc, splits[:N_DL_SPLITS],
+)
+gru_macro_f1 = float(np.mean(gru_f1))
+
+print(f"\nTraining LSTM on full TPG sequence...")
+lstm_f1, lstm_oof = cv_eval_dl(
+    lambda: RNNModel(N_CHANNELS, len(le.classes_), rnn_type="lstm"),
+    X_full_seq, y_enc, splits[:N_DL_SPLITS],
+)
+lstm_macro_f1 = float(np.mean(lstm_f1))
+
+# CNN on full sequence for a same-input apples-to-apples comparison
+print(f"\nTraining 1D-CNN on full TPG sequence (same input as RNNs)...")
+cnn_full_f1, cnn_full_oof = cv_eval_dl(
+    lambda: CNN1D(N_CHANNELS, len(le.classes_)),
+    X_full_seq, y_enc, splits[:N_DL_SPLITS],
+)
+cnn_full_macro_f1 = float(np.mean(cnn_full_f1))
+
+best_rnn      = "GRU" if gru_macro_f1 >= lstm_macro_f1 else "LSTM"
+best_rnn_f1   = max(gru_macro_f1, lstm_macro_f1)
+best_rnn_oof  = gru_oof if best_rnn == "GRU" else lstm_oof
+
+print(f"\nFull-sequence results ({N_DL_SPLITS}-fold mean, fold spread shown):")
+print(f"  GRU  : {gru_macro_f1:.4f}  (folds: {', '.join(f'{f:.4f}' for f in gru_f1)})")
+print(f"  LSTM : {lstm_macro_f1:.4f}  (folds: {', '.join(f'{f:.4f}' for f in lstm_f1)})")
+print(f"  CNN  : {cnn_full_macro_f1:.4f}  (folds: {', '.join(f'{f:.4f}' for f in cnn_full_f1)}, same full-seq input)")
+print(f"  CNN  : {cnn_macro_f1:.4f}  (folds: {', '.join(f'{f:.4f}' for f in cnn_f1)}, Gesture-phase only, Q1)")
+
+```
+
+### Q3: Is model ranking consistent between full-sensor and IMU-only subsets?
+
+```{python}
+#| echo: false
+
+y_arr = y_enc  # int labels aligned to seq_pd row order
+
+# DL OOF arrays are only filled for splits[:N_DL_SPLITS]; restrict evaluation to those indices
+dl_val_idx = np.concatenate([vl for _, vl in splits[:N_DL_SPLITS]])
+dl_covered = np.zeros(len(y_enc), dtype=bool)
+dl_covered[dl_val_idx] = True
+
+def subset_f1(oof_preds, mask):
+    m = mask & dl_covered
+    return f1_score(y_arr[m], oof_preds[m], average="macro", zero_division=0)
+
+rows = [
+    {"Model": "XGBoost (engineered, full-sensor subset only; modeling_baseline Q10)",
+     "Full-sensor F1": 0.4929, "IMU-only F1": None},
+    {"Model": "CNN (Gesture-phase only, Q1)",
+     "Full-sensor F1": subset_f1(cnn_oof,      full_sensor_mask),
+     "IMU-only F1"   : subset_f1(cnn_oof,      imu_only_mask)},
+    {"Model": f"CNN (full sequence, Q2)",
+     "Full-sensor F1": subset_f1(cnn_full_oof, full_sensor_mask),
+     "IMU-only F1"   : subset_f1(cnn_full_oof, imu_only_mask)},
+    {"Model": f"{best_rnn} (full sequence, Q2)",
+     "Full-sensor F1": subset_f1(best_rnn_oof, full_sensor_mask),
+     "IMU-only F1"   : subset_f1(best_rnn_oof, imu_only_mask)},
+]
+ranking_df = pd.DataFrame(rows).round(4)
+print(ranking_df.to_string(index=False))
+
+```
+
+### Model F1 comparison: Q1–3
+
+```{python}
+#| echo: false
+
+fig, ax = plt.subplots(figsize=(9, 4))
+labels  = [f"XGBoost\n(engineered)\n5-fold",
+           f"CNN\n(Gesture-phase)\n{N_DL_SPLITS}-fold",
+           f"CNN\n(Full-seq)\n{N_DL_SPLITS}-fold",
+           f"{best_rnn}\n(Full-seq)\n{N_DL_SPLITS}-fold"]
+scores  = [XGB_BASELINE_F1, cnn_macro_f1, cnn_full_macro_f1, best_rnn_f1]
+colors  = ["#43A047", "#1976D2", "#1976D2", "#E53935"]
+fold_ls = [None, cnn_f1, cnn_full_f1, gru_f1 if best_rnn == "GRU" else lstm_f1]
+
+x    = np.arange(len(scores))
+bars = ax.bar(x, scores, color=colors, width=0.5, edgecolor="white", zorder=2)
+ax.axhline(XGB_BASELINE_F1, color="#43A047", linestyle="--", linewidth=1, alpha=0.5, zorder=1)
+for i, folds in enumerate(fold_ls):
+    if folds:
+        ax.plot([x[i], x[i]], [min(folds), max(folds)], color="black", linewidth=2, zorder=5)
+        ax.plot(x[i], min(folds), "v", color="black", markersize=5, zorder=5)
+        ax.plot(x[i], max(folds), "^", color="black", markersize=5, zorder=5)
+for bar, s in zip(bars, scores):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.006,
+            f"{s:.4f}", ha="center", va="bottom", fontsize=9)
+ax.set_xticks(x)
+ax.set_xticklabels(labels, fontsize=9)
+ax.set_ylabel("Macro F1")
+ax.set_title(f"Q1–3: Model comparison (error bars = per-fold range, {N_DL_SPLITS}-fold DL)")
+ax.set_ylim(0, 0.68)
+plt.tight_layout()
+plt.show()
+plt.close()
+```
+
+## Missing modality handling
+
+Three RF strategies are compared across all 8,151 sequences. All use `RandomForestClassifier(n_estimators=100, max_depth=10)` with 5-fold GroupKFold.
+
+```{python}
+#| echo: false
+#| cache: true
+# Feature engineering for Q4-6: IMU + thm + tof for all 8151 sequences.
+# Mirrors modeling_baseline Q4/Q10/Q11 construction; self-contained here for standalone state.
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestClassifier
+
+IMU_AGG_COLS = ["acc_x","acc_y","acc_z","rot_w","rot_x","rot_y","rot_z","acc_mag"]
+THM_COLS_RAW = [f"thm_{i}" for i in range(1, 6)]
+TOF_V0_COLS  = [f"tof_{s}_v0" for s in range(1, 6)]
+
+# IMU: 32 features (mean/std/min/max × 7 channels + acc_mag, Gesture phase)
+gesture_imu = train_df.filter(pl.col("phase") == "Gesture").with_columns(
+    pl.mean_horizontal([pl.col(c).abs() for c in ["acc_x","acc_y","acc_z"]]).alias("acc_mag")
+)
+imu_feats = gesture_imu.group_by("sequence_id").agg(
+    [pl.col(c).mean().alias(f"{c}_mean") for c in IMU_AGG_COLS] +
+    [pl.col(c).std() .alias(f"{c}_std")  for c in IMU_AGG_COLS] +
+    [pl.col(c).min() .alias(f"{c}_min")  for c in IMU_AGG_COLS] +
+    [pl.col(c).max() .alias(f"{c}_max")  for c in IMU_AGG_COLS]
+)
+imu_pd = seq_pd[["sequence_id"]].merge(imu_feats.to_pandas(), on="sequence_id", how="left")
+X_imu  = imu_pd.drop(columns="sequence_id").to_numpy(dtype=np.float32)
+
+# Thm: 6 features (mean, std, 4 spatial gradients; Gesture phase)
+thm_feats = (
+    train_df.filter(pl.col("phase") == "Gesture")
+    .with_columns([
+        pl.mean_horizontal(THM_COLS_RAW).alias("thm_row_mean"),
+        (pl.col("thm_2") - pl.col("thm_1")).alias("thm_g1"),
+        (pl.col("thm_3") - pl.col("thm_2")).alias("thm_g2"),
+        (pl.col("thm_4") - pl.col("thm_3")).alias("thm_g3"),
+        (pl.col("thm_5") - pl.col("thm_4")).alias("thm_g4"),
+    ])
+    .group_by("sequence_id").agg([
+        pl.col("thm_row_mean").mean().alias("thm_mean"),
+        pl.col("thm_row_mean").std() .alias("thm_std"),
+        pl.col("thm_g1").mean().alias("thm_g1"),
+        pl.col("thm_g2").mean().alias("thm_g2"),
+        pl.col("thm_g3").mean().alias("thm_g3"),
+        pl.col("thm_g4").mean().alias("thm_g4"),
+    ])
+)
+thm_pd = seq_pd[["sequence_id"]].merge(thm_feats.to_pandas(), on="sequence_id", how="left")
+X_thm  = thm_pd.drop(columns="sequence_id").to_numpy(dtype=np.float32)   # NaN for missing seqs
+
+# ToF: 5 per-sensor valid means (sentinel -1 masked to null before averaging)
+tof_feats = (
+    train_df.filter(pl.col("phase") == "Gesture")
+    .with_columns([
+        pl.when(pl.col(c) == -1).then(None).otherwise(pl.col(c)).alias(c)
+        for c in TOF_V0_COLS
+    ])
+    .group_by("sequence_id").agg([
+        pl.col(c).mean().alias(f"{c}_mean") for c in TOF_V0_COLS
+    ])
+)
+tof_pd = seq_pd[["sequence_id"]].merge(tof_feats.to_pandas(), on="sequence_id", how="left")
+X_tof  = tof_pd.drop(columns="sequence_id").to_numpy(dtype=np.float32)   # NaN for missing seqs
+
+# Zero-fill: replace NaN with 0.0 for sequences without sensor coverage
+X_thm_zf = np.where(np.isnan(X_thm), 0.0, X_thm)
+X_tof_zf  = np.where(np.isnan(X_tof),  0.0, X_tof)
+X_full_zf = np.concatenate([X_imu, X_thm_zf, X_tof_zf], axis=1)
+
+N_IMU = X_imu.shape[1]   # 32
+N_THM = X_thm.shape[1]   # 6
+N_TOF = X_tof.shape[1]   # 5
+# integer column indices for thm+tof block (used in Q5 sensor dropout)
+SENSOR_COL_IDXS = np.arange(N_IMU, N_IMU + N_THM + N_TOF)
+
+print(f"IMU: {N_IMU} | Thm: {N_THM} | ToF: {N_TOF} | Full zero-fill: {X_full_zf.shape}")
+```
+
+```{python}
+#| echo: false
+RF_BASE    = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=1)
+y_str      = seq_pd["gesture"].to_numpy()
+n_full     = int(full_sensor_mask.sum())
+n_imu_only = int(imu_only_mask.sum())
+
+def cv_eval_rf(X, y_labels, splits, estimator=None):
+    """Returns (fold_macro_f1_list, oof_predictions)."""
+    if estimator is None:
+        estimator = RF_BASE
+    oof = np.empty(len(y_labels), dtype=object)
+    f1s = []
+    for tr, vl in splits:
+        m = clone(estimator).fit(X[tr], y_labels[tr])
+        p = m.predict(X[vl])
+        oof[vl] = p
+        f1s.append(f1_score(y_labels[vl], p, average="macro", zero_division=0))
+    return f1s, oof
+
+def sub_f1(oof, true, mask):
+    return f1_score(true[mask], oof[mask], average="macro", zero_division=0)
+
+# column name constants used in Q4-6 comparison tables
+fs_col  = f"Full-sensor ({n_full})"
+imu_col = f"IMU-only ({n_imu_only})"
+
+```
+
+### Q4: Unified zero-fill vs. separate models per modality condition
+
+```{python}
+#| echo: false
+# Strategy A: unified model on all 8151 sequences, thm+tof zero-filled where absent
+print("Strategy A -- unified RF (zero-fill)...")
+f1_unif, oof_unif = cv_eval_rf(X_full_zf, y_str, splits)
+macro_unif = float(np.mean(f1_unif))
+
+# Strategy B: separate RF per modality condition
+#   full-sensor model  : trained on full-sensor train sequences (X_full_zf; no NaN there)
+#   IMU-only model     : trained on IMU-only train sequences    (X_imu;     no NaN)
+#   fallback           : if too few IMU-only train samples, use unified model
+print("Strategy B -- separate RF per modality...")
+oof_sep = np.empty(len(y_str), dtype=object)
+for fold_i, (tr, vl) in enumerate(splits):
+    tr_f = tr[full_sensor_mask[tr]]
+    tr_i = tr[imu_only_mask[tr]]
+    vl_f = vl[full_sensor_mask[vl]]
+    vl_i = vl[imu_only_mask[vl]]
+
+    if len(vl_f) > 0:
+        m_full = clone(RF_BASE).fit(X_full_zf[tr_f], y_str[tr_f])
+        oof_sep[vl_f] = m_full.predict(X_full_zf[vl_f])
+
+    if len(vl_i) > 0:
+        if len(tr_i) >= 18:   # need at least one sample per class
+            m_imu = clone(RF_BASE).fit(X_imu[tr_i], y_str[tr_i])
+            oof_sep[vl_i] = m_imu.predict(X_imu[vl_i])
+        else:
+            m_fb = clone(RF_BASE).fit(X_full_zf[tr], y_str[tr])
+            oof_sep[vl_i] = m_fb.predict(X_full_zf[vl_i])
+            print(f"  Fold {fold_i}: {len(tr_i)} IMU-only train samples -- fallback to unified")
+
+macro_sep = f1_score(y_str, oof_sep, average="macro", zero_division=0)
+
+q4_df = pd.DataFrame([
+    {"Strategy": "Unified (zero-fill)",
+     "Overall": macro_unif,
+     fs_col: sub_f1(oof_unif, y_str, full_sensor_mask),
+     imu_col: sub_f1(oof_unif, y_str, imu_only_mask)},
+    {"Strategy": "Separate models",
+     "Overall": macro_sep,
+     fs_col: sub_f1(oof_sep, y_str, full_sensor_mask),
+     imu_col: sub_f1(oof_sep, y_str, imu_only_mask)},
+]).round(4)
+print(q4_df.to_string(index=False))
+```
+
+### Q5: Does sensor-channel dropout during training improve IMU-only robustness?
+
+```{python}
+#| echo: false
+DROP_P = 0.3
+
+def sensor_dropout_aug(X_train, sensor_col_idxs, drop_p, random_state=42):
+    """Zero out thm+tof columns for a random drop_p fraction of training rows."""
+    rng  = np.random.default_rng(random_state)
+    X_aug = X_train.copy()
+    rows  = rng.choice(len(X_aug), size=int(len(X_aug) * drop_p), replace=False)
+    X_aug[np.ix_(rows, sensor_col_idxs)] = 0.0
+    return X_aug
+
+print(f"Sensor dropout: p={DROP_P} of each training fold's rows have thm+tof zeroed...")
+oof_drop = np.empty(len(y_str), dtype=object)
+f1s_drop = []
+for tr, vl in splits:
+    X_tr_aug = sensor_dropout_aug(X_full_zf[tr], SENSOR_COL_IDXS, DROP_P)
+    m = clone(RF_BASE).fit(X_tr_aug, y_str[tr])
+    p = m.predict(X_full_zf[vl])
+    oof_drop[vl] = p
+    f1s_drop.append(f1_score(y_str[vl], p, average="macro", zero_division=0))
+
+macro_drop   = float(np.mean(f1s_drop))
+drop_f1_full = sub_f1(oof_drop, y_str, full_sensor_mask)
+drop_f1_imu  = sub_f1(oof_drop, y_str, imu_only_mask)
+
+# pull Q4 baselines for comparison (oof_unif, macro_unif already in scope)
+unif_f1_full = sub_f1(oof_unif, y_str, full_sensor_mask)
+unif_f1_imu  = sub_f1(oof_unif, y_str, imu_only_mask)
+
+q5_df = pd.DataFrame([
+    {"Strategy": "Unified (zero-fill, Q4)",     "Overall": macro_unif, fs_col: unif_f1_full, imu_col: unif_f1_imu},
+    {"Strategy": f"Sensor dropout (p={DROP_P})", "Overall": macro_drop, fs_col: drop_f1_full, imu_col: drop_f1_imu},
+]).round(4)
+print(q5_df.to_string(index=False))
+```
+
+### Q6: Does a binary sensor-presence gate improve mixed-modality performance?
+
+```{python}
+#| echo: false
+# Append has_thm / has_tof as binary (0/1) gate signals to the zero-fill feature matrix.
+has_thm_f = presence_pd["has_thm"].fillna(False).astype(np.float32).to_numpy().reshape(-1, 1)
+has_tof_f = presence_pd["has_tof"].fillna(False).astype(np.float32).to_numpy().reshape(-1, 1)
+X_gated   = np.concatenate([X_full_zf, has_thm_f, has_tof_f], axis=1)
+
+print("Gated RF (zero-fill + has_thm + has_tof binary flags)...")
+f1s_gate, oof_gate = cv_eval_rf(X_gated, y_str, splits)
+macro_gate   = float(np.mean(f1s_gate))
+gate_f1_full = sub_f1(oof_gate, y_str, full_sensor_mask)
+gate_f1_imu  = sub_f1(oof_gate, y_str, imu_only_mask)
+
+q6_df = pd.DataFrame([
+    {"Strategy": "Unified (zero-fill, Q4)",        "Overall": macro_unif, fs_col: unif_f1_full, imu_col: unif_f1_imu},
+    {"Strategy": f"Sensor dropout (p={DROP_P}, Q5)","Overall": macro_drop, fs_col: drop_f1_full, imu_col: drop_f1_imu},
+    {"Strategy": "Gated (zero-fill + flag)",        "Overall": macro_gate, fs_col: gate_f1_full, imu_col: gate_f1_imu},
+]).round(4)
+print(q6_df.to_string(index=False))
+
+gate_lift   = macro_gate - macro_unif
+```
+
+### Missing-modality strategy comparison: Q4–6
+
+```{python}
+#| echo: false
+
+fig, ax = plt.subplots(figsize=(7, 4))
+strat_labels = ["Unified\n(zero-fill)", f"Sensor\ndropout p={DROP_P}", "Gated\n(+flag)"]
+strat_scores = [macro_unif, macro_drop, macro_gate]
+strat_colors = ["#1976D2", "#7B1FA2", "#388E3C"]
+bars = ax.bar(strat_labels, strat_scores, color=strat_colors, width=0.45, edgecolor="white")
+ax.set_ylabel("Overall macro F1")
+ax.set_title("Q4–6: Missing-modality strategies (RF, 5-fold GroupKFold)")
+ax.set_ylim(0.55, 0.61)
+for bar, s in zip(bars, strat_scores):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
+            f"{s:.4f}", ha="center", va="bottom", fontsize=9)
+plt.tight_layout()
+plt.show()
+plt.close()
+```
+
+## Ensemble and post-processing
+
+### Q7: Does majority-vote ensembling improve macro F1 over the best individual model?
+
+```{python}
+#| echo: false
+from collections import Counter
+
+# Restrict ensemble to sequences covered by the DL OOF folds (splits[:N_DL_SPLITS]).
+# dl_covered defined in Q3; oof arrays are zero-filled outside those indices.
+cnn_str = le.inverse_transform(cnn_oof[dl_covered])
+rnn_str = le.inverse_transform(best_rnn_oof[dl_covered])
+
+# 3-model majority vote (avoids 2-model tie problem)
+all_preds  = np.column_stack([oof_unif[dl_covered], cnn_str, rnn_str])
+ens_preds  = np.array([Counter(row).most_common(1)[0][0] for row in all_preds])
+ens_f1     = f1_score(y_str[dl_covered], ens_preds, average="macro", zero_division=0)
+# RF individual F1 also restricted to same subset for fair comparison
+rf_sub_f1  = f1_score(y_str[dl_covered], oof_unif[dl_covered], average="macro", zero_division=0)
+best_ind   = max(rf_sub_f1, cnn_macro_f1, best_rnn_f1)
+lift_q7    = ens_f1 - best_ind
+
+print(f"(evaluated on {dl_covered.sum()} sequences covered by {N_DL_SPLITS} DL folds)")
+print(pd.Series({
+    "RF (full features, same subset)": rf_sub_f1,
+    "CNN (IMU Gesture-phase, Q1)"    : cnn_macro_f1,
+    f"{best_rnn} (IMU full-seq, Q2)" : best_rnn_f1,
+    "Majority vote (3-model)"        : ens_f1,
+}).round(4).to_string())
+print(f"\nEnsemble lift vs best individual: {lift_q7:+.4f}")
+
+```
+
+### Ensemble comparison: Q7
+
+```{python}
+#| echo: false
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ens_labels = ["RF (full feat.)\nsame subset", f"CNN\nGesture-phase",
+              f"{best_rnn}\nFull-seq", "Majority vote\n(3-model)"]
+ens_scores = [rf_sub_f1, cnn_macro_f1, best_rnn_f1, ens_f1]
+ens_colors = ["#43A047", "#1976D2", "#E53935", "#F57C00"]
+bars = ax.bar(ens_labels, ens_scores, color=ens_colors, width=0.45, edgecolor="white")
+ax.set_ylabel("Macro F1")
+ax.set_title(f"Q7: Ensemble comparison ({dl_covered.sum()} DL-covered sequences)")
+ax.set_ylim(0, 0.72)
+for bar, s in zip(bars, ens_scores):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+            f"{s:.4f}", ha="center", va="bottom", fontsize=9)
+plt.tight_layout()
+plt.show()
+plt.close()
+```
+
+### Q8: Do confidence-threshold substitution rules improve predictions without retraining?
+
+```{python}
+#| echo: false
+# Data-driven post-processing: for low-confidence predictions, substitute second-best class.
+# Uses RF predict_proba OOF on X_imu (IMU features -- interpretable baseline).
+CONF_THRESH = 0.35
+class_order  = np.sort(np.unique(y_str))   # consistent with m.classes_ (RF sorts alphabetically)
+oof_proba    = np.zeros((len(y_str), len(class_order)), dtype=np.float32)
+
+for tr, vl in splits:
+    m = clone(RF_BASE).fit(X_imu[tr], y_str[tr])
+    col_idx = np.searchsorted(class_order, m.classes_)
+    oof_proba[np.ix_(vl, col_idx)] = m.predict_proba(X_imu[vl])
+
+max_proba  = oof_proba.max(axis=1)
+sort_idx   = np.argsort(oof_proba, axis=1)
+best_cls   = class_order[sort_idx[:, -1]]
+second_cls = class_order[sort_idx[:, -2]]
+
+post_preds = np.where(max_proba < CONF_THRESH, second_cls, best_cls)
+base_f1_q8 = f1_score(y_str, best_cls,   average="macro", zero_division=0)
+post_f1_q8 = f1_score(y_str, post_preds, average="macro", zero_division=0)
+n_swapped  = int((max_proba < CONF_THRESH).sum())
+lift_q8    = post_f1_q8 - base_f1_q8
+
+print(f"Confidence threshold : {CONF_THRESH}")
+print(f"Sequences swapped    : {n_swapped} / {len(y_str)} ({100*n_swapped/len(y_str):.1f}%)")
+print(f"Base RF macro F1     : {base_f1_q8:.4f}  (X_imu, 32 IMU features)")
+print(f"Post-processed F1    : {post_f1_q8:.4f}  ({lift_q8:+.4f})")
+```
+
+### Q9: Does probability calibration (temperature scaling) improve macro F1?
+
+```{python}
+#| echo: false
+# Temperature scaling is a monotonic per-class probability rescaling.
+# Monotonic transformations preserve argmax → hard predictions unchanged → F1 unchanged.
+# Demonstrate empirically using Q8's oof_proba (no retraining needed).
+
+T = 0.5   # lower temperature sharpens the distribution (proxy for calibration)
+log_p   = np.log(oof_proba + 1e-10)
+p_sharp = np.exp(log_p / T)
+p_sharp /= p_sharp.sum(axis=1, keepdims=True)
+
+preds_orig  = class_order[oof_proba.argmax(axis=1)]
+preds_sharp = class_order[p_sharp.argmax(axis=1)]
+rank_unchanged = (preds_orig == preds_sharp).mean() * 100
+
+f1_orig  = f1_score(y_str, preds_orig,  average="macro", zero_division=0)
+f1_sharp = f1_score(y_str, preds_sharp, average="macro", zero_division=0)
+
+print(f"Temperature T={T}  |  argmax unchanged: {rank_unchanged:.1f}% of sequences")
+print(f"Macro F1 original : {f1_orig:.4f}")
+print(f"Macro F1 sharpened: {f1_sharp:.4f}  ({f1_sharp - f1_orig:+.4f})")
+```
+
+## Interpretability: feature importance, SHAP, BFRB vs. non-BFRB
+
+### Q10: What are the RF's top features, and do they align with domain intuition?
+
+```{python}
+#| echo: false
+# Feature names match the column order of X_full_zf (IMU block, then thm, then tof)
+feat_names = (
+    [c for c in imu_pd.columns if c != "sequence_id"] +
+    [c for c in thm_pd.columns if c != "sequence_id"] +
+    [c for c in tof_pd.columns if c != "sequence_id"]
+)
+
+# Fit RF on full training set for stable importance (CV is for evaluation, not interpretation)
+rf_full = clone(RF_BASE).fit(X_full_zf, y_str)
+imp = pd.Series(rf_full.feature_importances_, index=feat_names).sort_values(ascending=False)
+top10 = imp.head(10)
+
+print("Top 10 features (RF MDI, full training set):")
+print(top10.round(4).to_string())
+
+baseline_top = "acc_y_std"
+rank = list(top10.index).index(baseline_top) + 1 if baseline_top in top10.index else ">10"
+print(f"\n'{baseline_top}' (top feature in IMU-only RF, modeling_baseline Q5) ranks #{rank} in the full-feature RF.")
+
+# Sensor-group breakdown of top 10
+imu_in_top  = sum(1 for f in top10.index if f.startswith(("acc_","rot_")))
+thm_in_top  = sum(1 for f in top10.index if f.startswith("thm_"))
+tof_in_top  = sum(1 for f in top10.index if f.startswith("tof_"))
+print(f"\nTop-10 sensor breakdown: IMU={imu_in_top}  Thm={thm_in_top}  ToF={tof_in_top}")
+
+# Feature importance bar chart
+top15 = imp.head(15)
+colors_fi = ["#2196F3" if f.startswith(("acc_","rot_")) else
+             "#FF9800" if f.startswith("thm_") else "#4CAF50"
+             for f in top15.index]
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.barh(top15.index[::-1], top15.values[::-1], color=colors_fi[::-1])
+ax.set_xlabel("MDI feature importance")
+ax.set_title("Q10: RF top-15 features (full training set)")
+ax.legend(handles=[Patch(color="#2196F3", label="IMU"),
+                   Patch(color="#FF9800", label="Thermopile"),
+                   Patch(color="#4CAF50", label="ToF")], loc="lower right")
+plt.tight_layout()
+plt.show()
+plt.close()
+```
+
+### Q11: Which sensors and features drive predictions?
+
+```{python}
+#| echo: false
+
+try:
+    import shap
+    HAS_SHAP = True
+except ImportError:
+    HAS_SHAP = False
+    print("shap not installed -- run `pip install shap` in cmi-venv.")
+
+if HAS_SHAP:
+    rng_shap   = np.random.default_rng(0)
+    sample_idx = rng_shap.choice(len(X_full_zf), size=200, replace=False)
+    explainer  = shap.TreeExplainer(rf_full)
+    shap_vals  = explainer.shap_values(X_full_zf[sample_idx])   # list of 18 arrays (500, 43)
+
+    # Normalize SHAP format: SHAP >= ~0.42 returns (n_samples, n_features, n_classes);
+    # older returns list of n_classes arrays each (n_samples, n_features) → stacked (n_classes, n_samples, n_features)
+    shap_raw = np.array(shap_vals)
+    if shap_raw.ndim == 3 and shap_raw.shape[0] == len(sample_idx):
+        shap_3d = np.abs(shap_raw).transpose(2, 0, 1)   # (n_classes, n_samples, n_features)
+    else:
+        shap_3d = np.abs(shap_raw)                       # already (n_classes, n_samples, n_features)
+    mean_abs = shap_3d.mean(axis=(0, 1))    # (n_features,)
+    top_idx  = np.argsort(mean_abs)[-15:]
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    colors  = ["#2196F3" if feat_names[i].startswith(("acc_","rot_")) else
+               "#FF9800" if feat_names[i].startswith("thm_") else
+               "#4CAF50" for i in top_idx]
+    ax.barh([feat_names[i] for i in top_idx], mean_abs[top_idx], color=colors)
+    ax.set_xlabel("Mean |SHAP value| (avg across 18 classes, 500 samples)")
+    ax.set_title("SHAP global feature importance: Full-feature RF")
+    ax.legend(handles=[
+        Patch(color="#2196F3", label="IMU"),
+        Patch(color="#FF9800", label="Thermopile"),
+        Patch(color="#4CAF50", label="ToF"),
+    ], loc="lower right")
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+    top_shap_feat = feat_names[mean_abs.argmax()]
+    top_sensor    = "IMU" if top_shap_feat.startswith(("acc_","rot_")) else \
+                    "Thermopile" if top_shap_feat.startswith("thm_") else "ToF"
+    print(f"Highest global SHAP feature: {top_shap_feat} ({top_sensor})")
+```
+
+### Q12: Do BFRB and non-BFRB gestures differ in feature importance? What does the model actually detect?
+
+```{python}
+#| echo: false
+from sklearn.metrics import classification_report
+
+BFRB_GESTURES = {
+    "Above ear - pull hair", "Cheek - pinch skin", "Eyebrow - pull hair",
+    "Eyelash - pull hair", "Forehead - pull hairline", "Forehead - scratch",
+    "Neck - pinch skin", "Neck - scratch", "Pinch knee/leg skin", "Scratch knee/leg skin",
+}
+classes  = rf_full.classes_   # sorted; aligns with shap_vals ordering if HAS_SHAP
+is_bfrb  = np.array([g in BFRB_GESTURES for g in classes])
+
+print(f"BFRB  ({is_bfrb.sum()}): {list(classes[is_bfrb])}")
+print(f"Non-BFRB ({(~is_bfrb).sum()}): {list(classes[~is_bfrb])}")
+
+# Per-class F1 from Q4 OOF (oof_unif, RF on X_full_zf)
+cr = classification_report(y_str, oof_unif, output_dict=True, zero_division=0)
+bfrb_f1     = np.mean([cr[c]["f1-score"] for c in classes[is_bfrb]])
+non_bfrb_f1 = np.mean([cr[c]["f1-score"] for c in classes[~is_bfrb]])
+print(f"\nMean per-class F1 | BFRB: {bfrb_f1:.4f}  |  Non-BFRB: {non_bfrb_f1:.4f}")
+
+if HAS_SHAP:
+    shap_arr      = shap_3d                                 # (n_classes, n_samples, n_features) from Q11
+    bfrb_shap     = shap_arr[is_bfrb].mean(axis=(0, 1))    # (n_features,)
+    non_bfrb_shap = shap_arr[~is_bfrb].mean(axis=(0, 1))   # (n_features,)
+
+    top5_bfrb     = pd.Series(bfrb_shap,     index=feat_names).nlargest(5)
+    top5_non_bfrb = pd.Series(non_bfrb_shap, index=feat_names).nlargest(5)
+    thm_share_bfrb    = bfrb_shap[[i for i, f in enumerate(feat_names) if f.startswith("thm_")]].sum() / bfrb_shap.sum()
+    thm_share_nonbfrb = non_bfrb_shap[[i for i, f in enumerate(feat_names) if f.startswith("thm_")]].sum() / non_bfrb_shap.sum()
+
+    print("\nTop 5 features driving BFRB class predictions:")
+    print(top5_bfrb.round(4).to_string())
+    print("\nTop 5 features driving non-BFRB class predictions:")
+    print(top5_non_bfrb.round(4).to_string())
+    print(f"Thermopile share of total SHAP: BFRB={thm_share_bfrb:.1%}  Non-BFRB={thm_share_nonbfrb:.1%}")
+else:
+    print(f"BFRB F1: {bfrb_f1:.4f}  Non-BFRB F1: {non_bfrb_f1:.4f}  (install shap for feature-level decomposition)")
+```
+
+### BFRB vs. non-BFRB: F1 and thermopile SHAP share
+
+```{python}
+#| echo: false
+
+fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+
+# Left: per-class mean F1
+ax = axes[0]
+ax.bar(["BFRB", "Non-BFRB"], [bfrb_f1, non_bfrb_f1],
+       color=["#E53935", "#1976D2"], width=0.4, edgecolor="white")
+ax.set_ylabel("Mean per-class macro F1")
+ax.set_title("Q12: Per-class F1 by gesture type")
+ax.set_ylim(0, 0.85)
+for i, v in enumerate([bfrb_f1, non_bfrb_f1]):
+    ax.text(i, v + 0.01, f"{v:.4f}", ha="center", va="bottom", fontsize=10)
+
+# Right: thermopile SHAP share (only if SHAP ran)
+ax2 = axes[1]
+if HAS_SHAP:
+    ax2.bar(["BFRB", "Non-BFRB"], [thm_share_bfrb, thm_share_nonbfrb],
+            color=["#FF6F00", "#FF6F00"], alpha=[1.0, 0.55], width=0.4, edgecolor="white")
+    ax2.set_ylabel("Thermopile share of total |SHAP|")
+    ax2.set_title("Q12: Thermopile SHAP contribution")
+    ax2.set_ylim(0, 0.35)
+    for i, v in enumerate([thm_share_bfrb, thm_share_nonbfrb]):
+        ax2.text(i, v + 0.005, f"{v:.1%}", ha="center", va="bottom", fontsize=10)
+else:
+    ax2.text(0.5, 0.5, "SHAP not available\n(install shap)", ha="center", va="center",
+             transform=ax2.transAxes, fontsize=10, color="gray")
+    ax2.set_title("Q12: Thermopile SHAP contribution")
+
+plt.tight_layout()
+plt.show()
+plt.close()
+```
+
+## Limitations and recommended future work
+
+**IMU-only subset size.** The IMU-only subset contains approximately 96 sequences across 18 gesture classes (~5 per class on average). Every metric computed on this subset (Q3 IMU-only F1, Q5 robustness gain, Q6 gated-model IMU-only F1) has high variance and should be treated as indicative rather than conclusive. A larger collection of IMU-only sequences (or deliberate data collection without thermopile/ToF coverage) would be needed to reliably compare modality strategies on this condition.
+
+**DL models trained on fewer folds than RF.** CNN, GRU, and LSTM were trained on 3 of 5 folds to limit CPU runtime. This means their F1 estimates are noisier than the 5-fold RF results and the comparison in Q3's ranking table conflates model quality with evaluation uncertainty. Running DL on all 5 folds would narrow the confidence intervals and make the Q1–Q3 conclusions more defensible.
+
+**Negative ensemble result (Q7).** The 3-model majority vote scored 0.5646 vs. RF alone at 0.5807 on the same subset (−0.0161 lift). This is a negative result, not a failure: it reveals that the DL and RF models make *correlated* errors on this dataset at this training scale. The DL models, trained on 10 epochs on CPU, likely haven't reached the diversity needed to complement the RF's error profile. Future work: (a) train DL models to convergence; (b) try soft-voting on calibrated probabilities rather than majority vote; (c) use a learned stacker instead of a fixed vote.
+
+**Recommended next steps.** (1) Add GPU training or increase epoch budget for the DL models to reduce the F1 gap vs. XGBoost. (2) Explore sequence-level augmentation (time-warping, jitter) to reduce DL overfitting. (3) Apply proper isotonic calibration to the RF's probabilities for ranking or cost-sensitive decision tasks. (4) Investigate per-gesture misclassification patterns: BFRB F1 (0.5160) is substantially below non-BFRB (0.7183), suggesting class-specific threshold tuning or gesture-group-aware loss weighting may help.
+
+## Summary table
+
+```{python}
+#| echo: false
+
+summary_rows = [
+    {"Question": "Q1: 1D-CNN vs. XGBoost",        "Finding": "XGBoost leads",              "Key metric": f"CNN {cnn_macro_f1:.4f} vs. XGB {XGB_BASELINE_F1:.4f} ({cnn_macro_f1 - XGB_BASELINE_F1:+.4f})"},
+    {"Question": "Q2: GRU/LSTM vs. CNN (full-seq)","Finding": "CNN leads on full sequence", "Key metric": f"CNN {cnn_full_macro_f1:.4f}  GRU {gru_macro_f1:.4f}  LSTM {lstm_macro_f1:.4f}"},
+    {"Question": "Q3: Subset ranking stability",   "Finding": "Ranking consistent",         "Key metric": "Full-sensor order holds on IMU-only subset"},
+    {"Question": "Q4: Unified vs. separate RF",    "Finding": "Unified wins",               "Key metric": f"Unified {macro_unif:.4f}"},
+    {"Question": "Q5: Sensor dropout aug.",        "Finding": "No meaningful gain",         "Key metric": f"Dropout {macro_drop:.4f} vs. unified {macro_unif:.4f} ({macro_drop - macro_unif:+.4f})"},
+    {"Question": "Q6: Gated RF",                   "Finding": "Within noise; no winner",   "Key metric": f"Gated {macro_gate:.4f} vs. unified {macro_unif:.4f} ({gate_lift:+.4f})"},
+    {"Question": "Q7: 3-model majority vote",      "Finding": "Negative result (–0.0161)", "Key metric": f"Ensemble {ens_f1:.4f} vs. RF {rf_sub_f1:.4f}"},
+    {"Question": "Q8: Confidence swap post-proc.", "Finding": "Hurt F1",                   "Key metric": f"{base_f1_q8:.4f} -> {post_f1_q8:.4f} ({lift_q8:+.4f})"},
+    {"Question": "Q9: Probability calibration",    "Finding": "No effect on macro F1",     "Key metric": f"{f1_orig:.4f} -> {f1_sharp:.4f} ({f1_sharp - f1_orig:+.4f})"},
+    {"Question": "Q10: RF feature importance",     "Finding": "IMU + thermopile dominate",  "Key metric": f"Top feature: {imp.index[0]}  ({imp.iloc[0]:.4f} MDI)"},
+    {"Question": "Q11: SHAP summary",              "Finding": "thm_mean highest global",   "Key metric": "Thermopile features prominent despite IMU dominance in MDI"},
+    {"Question": "Q12: BFRB vs. non-BFRB",        "Finding": "Non-BFRB easier to classify","Key metric": f"BFRB F1 {bfrb_f1:.4f}  non-BFRB {non_bfrb_f1:.4f}  thm share {thm_share_bfrb:.1%} vs {thm_share_nonbfrb:.1%}" if HAS_SHAP else f"BFRB F1 {bfrb_f1:.4f}  non-BFRB {non_bfrb_f1:.4f}"},
+]
+
+summary_df = pd.DataFrame(summary_rows)
+print(summary_df.to_string(index=False))
+```

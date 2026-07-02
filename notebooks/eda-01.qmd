@@ -1,0 +1,827 @@
+﻿---
+title: "EDA 01"
+jupyter: cmi-venv
+---
+
+```{python}
+#| echo: false
+#| output: false
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from pathlib import Path
+from collections import Counter
+from scipy import stats
+```
+
+```{python}
+#| echo: false
+#| output: false
+# Load the data
+train_df = pl.read_csv("../data/train.csv")
+test_df = pl.read_csv("../data/test.csv")
+
+bfrb_gestures = {
+    "Above ear - pull hair", "Cheek - pinch skin", "Eyebrow - pull hair",
+    "Eyelash - pull hair", "Forehead - pull hairline", "Forehead - scratch",
+    "Neck - pinch skin", "Neck - scratch", "Pinch knee/leg skin", "Scratch knee/leg skin"
+}
+train_df = train_df.with_columns(
+    pl.col("gesture").is_in(bfrb_gestures).alias("is_bfrb")
+)
+
+print(f"Train shape: {train_df.shape}")
+print(f"Test shape: {test_df.shape}")
+```
+
+```{python}
+#| echo: false
+# Display first few rows of train data
+train_df.head()
+train_df.describe()
+train_df.sample(5)
+```
+
+
+# questions to answer:
+
+## Dataset Structure and Scope
+1. How many unique subjects, sequences, and gesture classes are in the training set?
+
+```{python}
+#| echo: false
+unique_subjects = train_df["subject"].n_unique()
+print(f"Unique subjects: {unique_subjects}")
+
+unique_sequence_ids = train_df["sequence_id"].n_unique()
+print(f"Unique sequence id's: {unique_sequence_ids}")
+
+unique_sequence_types = train_df["sequence_type"].n_unique()
+print(f"Unique sequence types: {unique_sequence_types}")
+
+unique_sequence_counters = train_df["sequence_counter"].n_unique()
+print(f"Unique sequence counters: {unique_sequence_counters}")
+
+unique_gestures = train_df["gesture"].n_unique()
+print(f"Unique gestures: {unique_gestures}")
+```
+
+2. What is the distribution of sequences per subject, are some subjects heavily over-represented?
+
+```{python}
+#| echo: false
+# calculate distribution stats per cateogory
+distribution = train_df.group_by("subject").agg(
+    pl.col("sequence_id").n_unique().alias("unique_sequence_ids"),
+    pl.col("sequence_type").n_unique().alias("unique_sequence_types"),
+    pl.col("sequence_counter").n_unique().alias("unique_sequence_counters"),
+)
+print(distribution)
+
+# frequency of sequences within each subject
+freq_distribution = distribution["unique_sequence_ids"].value_counts().sort("unique_sequence_ids")
+print(freq_distribution)
+```
+
+3. How many sequences are BFRB vs. non-BFRB (`sequence_type`)? Is there class imbalance at the gesture level?
+
+```{python}
+#| echo: false
+# sequence-level BFRB vs non-BFRB counts (one row per sequence)
+seq_level = (
+    train_df
+    .group_by("sequence_id")
+    .agg(
+        pl.col("sequence_type").first(),
+        pl.col("gesture").first(),
+        pl.col("is_bfrb").first(),
+    )
+)
+
+seq_type_counts = seq_level["sequence_type"].value_counts().sort("sequence_type")
+print(seq_type_counts)
+
+bfrb_seq_counts = seq_level["is_bfrb"].value_counts().sort("is_bfrb")
+print(bfrb_seq_counts)
+
+# gesture-level imbalance: sequences per gesture, sorted
+gesture_counts = (
+    seq_level
+    .group_by("gesture")
+    .agg(
+        pl.len().alias("n_sequences"),
+        pl.col("is_bfrb").first()
+    )
+    .sort("n_sequences", descending=True)
+)
+print(gesture_counts)
+
+# visualize
+fig, axes = plt.subplots(2, 1, figsize=(8, 8))
+fig.suptitle("Class Imbalance: Sequence Level")
+
+# BFRB vs non-BFRB
+labels = ["Non-BFRB", "BFRB"]
+counts = bfrb_seq_counts["count"].to_list()
+axes[0].bar(labels, counts, color=["orange", "steelblue"])
+axes[0].set_title("BFRB vs. Non-BFRB sequences")
+axes[0].set_ylabel("# sequences")
+for i, v in enumerate(counts):
+    axes[0].text(i, v + 20, str(v), ha="center")
+
+# per-gesture
+colors = ["steelblue" if b else "orange" for b in gesture_counts["is_bfrb"].to_list()]
+axes[1].barh(gesture_counts["gesture"].to_list(), gesture_counts["n_sequences"].to_list(), color=colors)
+axes[1].set_title("Sequences per gesture (blue=BFRB, orange=Non-BFRB)")
+axes[1].set_xlabel("# sequences")
+axes[1].invert_yaxis()
+
+plt.tight_layout()
+plt.show()
+```
+
+## Sequence Anatomy
+
+5. What are the typical lengths (in rows) of the Transition, Pause, and Gesture phases within a sequence?
+
+```{python}
+#| echo: false
+# what phases actually exist?
+print(train_df["phase"].unique().sort())
+
+# per-sequence length for each phase
+phase_lengths = (
+    train_df
+    .group_by("sequence_id", "phase")
+    .agg(pl.len().alias("length"))
+)
+
+# summary stats per phase
+summary = (
+    phase_lengths
+    .group_by("phase")
+    .agg(
+        pl.col("length").mean().alias("mean"),
+        pl.col("length").median().alias("median"),
+        pl.col("length").std().alias("std"),
+        pl.col("length").min().alias("min"),
+        pl.col("length").max().alias("max"),
+        pl.len().alias("n_sequences"),
+    )
+    .sort("phase")
+)
+print(summary)
+
+# distribution plot
+phases_present = train_df["phase"].unique().sort().to_list()
+fig, axes = plt.subplots(len(phases_present), 1, figsize=(8, 4 * len(phases_present)))
+if len(phases_present) == 1:
+    axes = [axes]
+fig.suptitle("Phase Length Distribution (rows per sequence)")
+
+for ax, phase in zip(axes, phases_present):
+    lengths = phase_lengths.filter(pl.col("phase") == phase)["length"].to_numpy()
+    ax.hist(lengths, bins=40)
+    ax.set_title(phase)
+    ax.set_xlabel("rows")
+    ax.set_ylabel("# sequences")
+    ax.axvline(lengths.mean(), color="red", linestyle="--", label=f"mean={lengths.mean():.0f}")
+    ax.legend(fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+6. Is phase length consistent across subjects and gestures, or highly variable?
+
+```{python}
+#| echo: false
+# join gesture and subject onto phase lengths
+phase_lengths_detail = (
+    train_df
+    .group_by("sequence_id", "phase")
+    .agg(
+        pl.len().alias("length"),
+        pl.col("gesture").first(),
+        pl.col("subject").first(),
+    )
+)
+
+# variability by gesture: focus on Gesture phase
+gesture_phase_var = (
+    phase_lengths_detail
+    .filter(pl.col("phase") == "Gesture")
+    .group_by("gesture")
+    .agg(
+        pl.col("length").mean().alias("mean_len"),
+        pl.col("length").std().alias("std_len"),
+        pl.col("length").median().alias("median_len"),
+    )
+    .with_columns(
+        (pl.col("std_len") / pl.col("mean_len")).alias("cv")  # coefficient of variation
+    )
+    .sort("mean_len", descending=True)
+)
+print(gesture_phase_var)
+
+# visualize gesture-phase length spread
+gestures = gesture_phase_var["gesture"].to_list()
+means = gesture_phase_var["mean_len"].to_numpy()
+stds = gesture_phase_var["std_len"].to_numpy()
+
+fig, ax = plt.subplots(figsize=(7, 8))
+y = np.arange(len(gestures))
+ax.barh(y, means, xerr=stds, align="center", alpha=0.7, capsize=4)
+ax.set_yticks(y)
+ax.set_yticklabels(gestures, fontsize=8)
+ax.set_xlabel("Gesture-phase length (rows) ± 1 std")
+ax.set_title("Gesture Phase Length by Gesture: Mean +/- Std")
+ax.invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+# does gesture-level CV survive controlling for subject, or is it just between-subject noise?
+subj_gesture_var = (
+    phase_lengths_detail
+    .filter(pl.col("phase") == "Gesture")
+    .group_by("subject", "gesture")
+    .agg(
+        pl.col("length").mean().alias("mean_len"),
+        pl.col("length").std().alias("std_len"),
+        pl.len().alias("n"),
+    )
+    .filter((pl.col("n") >= 3) & (pl.col("mean_len") > 0))
+    .with_columns((pl.col("std_len") / pl.col("mean_len")).alias("within_subject_cv"))
+)
+
+within_subject_cv_by_gesture = (
+    subj_gesture_var
+    .group_by("gesture")
+    .agg(pl.col("within_subject_cv").mean().alias("avg_within_subject_cv"))
+)
+
+# compare ranking: uncontrolled (mixed-subject) CV vs. within-subject CV
+compare_cv = gesture_phase_var.select(["gesture", "cv"]).join(
+    within_subject_cv_by_gesture, on="gesture", how="inner"
+).sort("cv", descending=True)
+print("Uncontrolled CV vs. within-subject CV by gesture:")
+print(compare_cv)
+
+rank_corr = compare_cv.select(
+    pl.corr("cv", "avg_within_subject_cv", method="spearman").alias("rank_corr")
+).item()
+print(f"\nSpearman rank correlation (uncontrolled vs within-subject CV): {rank_corr:.2f}")
+```
+
+7. Does the `behavior` column reliably segment phases, and are there any sequences with missing or malformed phase labels?
+
+```{python}
+#| echo: false
+behavior_reliability = train_df.select(pl.col("behavior").value_counts(sort=True)).unnest("behavior")
+print(behavior_reliability)
+
+# check missing behavior values count
+missing_behavior = train_df.filter(pl.col("behavior").is_null()).select(pl.col("sequence_id").n_unique())
+print(f"Missing behavior values count: {missing_behavior}")
+```
+
+## Sensor Modality Availability
+
+8. Which sequences have full sensor data (IMU + thermopile + ToF), and which are IMU-only?
+
+```{python}
+#| echo: false
+core_cols = (
+    ["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]
+    + [f"thm_{i}" for i in range(1, 6)]
+)
+
+# null counts per core column
+null_counts = train_df.select(pl.col(core_cols).is_null().sum())
+print("Null counts per core sensor column:")
+print(null_counts)
+
+# rot and thm_5 are the problem sensors: confirm they are independent failures
+overlap = train_df.with_columns([
+    pl.col("rot_w").is_null().alias("rot_missing"),
+    pl.col("thm_5").is_null().alias("thm5_missing"),
+]).group_by("rot_missing", "thm5_missing").agg(pl.len())
+print("\nRot vs thm_5 missingness overlap (zero overlap = independent failures):")
+print(overlap)
+
+# how many sequences are fully missing thm_5?
+total_seqs = train_df["sequence_id"].n_unique()
+thm5_dead_seqs = (
+    train_df.group_by("sequence_id")
+    .agg(pl.col("thm_5").is_null().mean().alias("pct"))
+    .filter(pl.col("pct") == 1.0)
+)
+print(f"\nSequences with thm_5 fully dead: {len(thm5_dead_seqs)} / {total_seqs} ({len(thm5_dead_seqs)/total_seqs:.1%})")
+
+# flag thm_5 absence, fill with mean; forward-fill rot within sequence
+train_df = train_df.with_columns([
+    pl.col("thm_5").is_not_null().cast(pl.Int8).alias("thm5_present"),
+    pl.col("thm_5").fill_null(pl.col("thm_5").mean()),
+])
+rot_cols = ["rot_w", "rot_x", "rot_y", "rot_z"]
+train_df = train_df.with_columns(
+    pl.col(rot_cols).forward_fill().over("sequence_id")
+)
+```
+
+9. Are thermopile or ToF channels ever partially missing (some channels null, others present), is failure per-sensor or all-or-nothing?
+
+```{python}
+#| echo: false
+# thm_5 was already filled in Q8: check patterns for thm_1 through thm_4
+failure_patterns = train_df.with_columns([
+    pl.col("thm_1").is_null().alias("thm1_missing"),
+    pl.col("thm_2").is_null().alias("thm2_missing"),
+    pl.col("thm_3").is_null().alias("thm3_missing"),
+    pl.col("thm_4").is_null().alias("thm4_missing"),
+]).group_by("thm1_missing", "thm2_missing", "thm3_missing", "thm4_missing").agg(pl.len()).sort("len", descending=True)
+print(failure_patterns)
+
+train_df = train_df.with_columns([
+    pl.any_horizontal(pl.col(["thm_1","thm_2","thm_3","thm_4"]).is_null())
+      .cast(pl.Int8).alias("thm1234_group_missing"),
+    pl.col(["thm_1","thm_2","thm_3","thm_4"]).fill_null(
+        pl.col(["thm_1","thm_2","thm_3","thm_4"]).mean()
+    ),
+])
+```
+
+10. Does `-1` in ToF columns mean no object detected, or does it indicate sensor failure? How frequent is it and does its frequency vary by gesture?
+
+- a -1.0 represents there is no sensor response, as per the official documentation
+
+```{python}
+#| echo: false
+tof_cols = [f"tof_{s}_v{v}" for s in range(1, 6) for v in range(64)]
+
+# overall -1.0 rate
+overall_rate = train_df.select(
+    pl.mean_horizontal([(pl.col(c) == -1.0).cast(pl.Float32) for c in tof_cols]).mean().alias("overall_tof_missing_rate")
+).item()
+print(f"Overall ToF -1.0 rate: {overall_rate:.1%}")
+
+# per-sensor rate: if one sensor were dead it would be ~100%, not ~60%
+for s in range(1, 6):
+    cols = [f"tof_{s}_v{v}" for v in range(64)]
+    rate = train_df.select(
+        pl.mean_horizontal([(pl.col(c) == -1.0).cast(pl.Float32) for c in cols]).mean()
+    ).item()
+    print(f"  tof_{s}: {rate:.1%}")
+
+# -1.0 rate by gesture: large variation = meaningful signal
+gesture_tof = (
+    train_df
+    .with_columns(
+        pl.mean_horizontal([(pl.col(c) == -1.0).cast(pl.Float32) for c in tof_cols])
+          .alias("tof_missing_rate")
+    )
+    .group_by("gesture")
+    .agg(pl.col("tof_missing_rate").mean().alias("avg_tof_missing_rate"))
+    .sort("avg_tof_missing_rate", descending=True)
+)
+print(“\n-1.0 rate by gesture (highest = hand furthest from sensor):”)
+print(gesture_tof)
+
+# add per-sensor missing rate as features
+train_df = train_df.with_columns([
+    pl.mean_horizontal([(pl.col(f"tof_{s}_v{v}") == -1.0).cast(pl.Float32)
+                        for v in range(64)]).alias(f"tof_{s}_missing_rate")
+    for s in range(1, 6)
+])
+```
+
+## Signal Character
+
+11. What does a raw IMU signal (acc and rot) look like plotted over time for a BFRB vs. a non-BFRB gesture?
+
+```{python}
+#| echo: false
+# pick one representative sequence per category
+# update gesture names once you have the full list
+bfrb_gesture     = "Above ear - pull hair"
+non_bfrb_gesture = "Wave hello"
+
+bfrb_seq = (
+    train_df.filter(pl.col("gesture") == bfrb_gesture)
+    .group_by("sequence_id").agg(pl.len()).sort("len", descending=True)
+    .head(1)["sequence_id"][0]
+)
+non_bfrb_seq = (
+    train_df.filter(pl.col("gesture") == non_bfrb_gesture)
+    .group_by("sequence_id").agg(pl.len()).sort("len", descending=True)
+    .head(1)["sequence_id"][0]
+)
+
+bfrb_data = train_df.filter(pl.col("sequence_id") == bfrb_seq).sort("sequence_counter")
+non_bfrb_data = train_df.filter(pl.col("sequence_id") == non_bfrb_seq).sort("sequence_counter")
+
+fig, axes = plt.subplots(2, 2, figsize=(7, 8), sharex=False)
+fig.suptitle("Raw IMU Signal: BFRB vs. Non-BFRB", fontsize=14)
+
+for col_idx, (data, label) in enumerate([(bfrb_data, f"BFRB\n{bfrb_gesture}"),
+                                          (non_bfrb_data, f"Non-BFRB\n{non_bfrb_gesture}")]):
+    t = data["sequence_counter"].to_numpy()
+
+    # accelerometer
+    ax = axes[0][col_idx]
+    for col, color in zip(["acc_x", "acc_y", "acc_z"], ["r", "g", "b"]):
+        ax.plot(t, data[col].to_numpy(), label=col, color=color, alpha=0.8)
+    ax.set_title(f”Accelerometer: {label}”)
+    ax.set_ylabel(“m/s²”)
+    ax.legend(fontsize=8)
+
+    # rotation
+    ax = axes[1][col_idx]
+    for col, color in zip(["rot_w", "rot_x", "rot_y", "rot_z"], ["k", "r", "g", "b"]):
+        ax.plot(t, data[col].to_numpy(), label=col, color=color, alpha=0.8)
+    ax.set_title(f”Rotation (quaternion): {label}”)
+    ax.set_ylabel("quaternion component")
+    ax.set_xlabel("sequence counter (time step)")
+    ax.legend(fontsize=8)
+
+plt.tight_layout()
+plt.show()
+
+bfrb_acc_range = (bfrb_data.select(pl.col(["acc_x","acc_y","acc_z"]).max() - pl.col(["acc_x","acc_y","acc_z"]).min())
+                   .to_numpy().flatten().mean())
+non_bfrb_acc_range = (non_bfrb_data.select(pl.col(["acc_x","acc_y","acc_z"]).max() - pl.col(["acc_x","acc_y","acc_z"]).min())
+                       .to_numpy().flatten().mean())
+print(f"BFRB ({bfrb_gesture}) avg acc range: {bfrb_acc_range:.2f} m/s²  |  "
+      f"Non-BFRB ({non_bfrb_gesture}): {non_bfrb_acc_range:.2f} m/s²")
+```
+
+12. Do thermopile channels show distinct warmth signatures during touch-based BFRBs (e.g. hair pulling, skin picking) vs. non-contact gestures?
+
+```{python}
+#| echo: false
+thm_cols = [f"thm_{i}" for i in range(1, 6)]
+
+# mean thm by gesture
+gesture_thm = (
+    train_df
+    .group_by("gesture")
+    .agg(
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean().alias("avg_thm"),
+        pl.col("is_bfrb").first()
+    )
+    .sort("avg_thm", descending=True)
+)
+print("Mean thermopile reading by gesture:")
+print(gesture_thm)
+
+bfrb_mean   = train_df.filter(pl.col("is_bfrb")).select(
+    pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean()).item()
+non_bfrb_mean = train_df.filter(~pl.col("is_bfrb")).select(
+    pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean()).item()
+print(f"\nBFRB mean thm: {bfrb_mean:.2f}°C  |  Non-BFRB mean thm: {non_bfrb_mean:.2f}°C  |  Gap: {bfrb_mean - non_bfrb_mean:.2f}°C")
+
+# distribution + time-series plots
+bfrb_thm = train_df.filter(pl.col("is_bfrb")).select(thm_cols).to_numpy().flatten()
+non_bfrb_thm = train_df.filter(~pl.col("is_bfrb")).select(thm_cols).to_numpy().flatten()
+bfrb_thm     = bfrb_thm[~np.isnan(bfrb_thm)]
+non_bfrb_thm = non_bfrb_thm[~np.isnan(non_bfrb_thm)]
+
+touch_seq = (
+    train_df.filter(pl.col("gesture") == "Cheek - pinch skin")
+    .group_by("sequence_id").agg(pl.len()).sort("len", descending=True)
+    .head(1)["sequence_id"][0]
+)
+air_seq = (
+    train_df.filter(pl.col("gesture") == "Write name in air")
+    .group_by("sequence_id").agg(pl.len()).sort("len", descending=True)
+    .head(1)["sequence_id"][0]
+)
+
+fig, axes = plt.subplots(2, 1, figsize=(8, 5))
+fig.suptitle("Thermopile Warmth: BFRB vs. Non-BFRB")
+
+axes[0].hist(bfrb_thm, bins=60, alpha=0.6, label="BFRB", density=True)
+axes[0].hist(non_bfrb_thm, bins=60, alpha=0.6, label="Non-BFRB", density=True)
+axes[0].set_xlabel("Thermopile reading (°C)")
+axes[0].set_ylabel("Density")
+axes[0].legend()
+axes[0].set_title("Distribution of all thm readings")
+
+colors = ["r", "g", "b", "orange", "purple"]
+for seq_id, label in [(touch_seq, "touch"), (air_seq, "no contact")]:
+    data = train_df.filter(pl.col("sequence_id") == seq_id).sort("sequence_counter")
+    t = data["sequence_counter"].to_numpy()
+    for col, c in zip(thm_cols, colors):
+        axes[1].plot(t, data[col].to_numpy(), color=c,
+                     label=f"{col} ({label})", alpha=0.7, linestyle="-" if label=="touch" else "--")
+
+axes[1].set_title("Thermopile over time: touch vs. no-contact")
+axes[1].set_xlabel("sequence counter")
+axes[1].set_ylabel("°C")
+axes[1].legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+```
+
+13. How spatially informative are the 8x8 ToF grids? Can you visualize a mean ToF frame per gesture class and see shape differences?
+
+```{python}
+#| echo: false
+fig, axes = plt.subplots(5, 2, figsize=(5, 8))
+fig.suptitle(“Mean ToF Frame (8x8) per Sensor: BFRB vs. Non-BFRB”)
+
+for s_idx, sensor in enumerate(range(1, 6)):
+    tof_cols_s = [f"tof_{sensor}_v{v}" for v in range(64)]
+
+    for row_idx, (label, mask) in enumerate([("BFRB", pl.col("is_bfrb")),
+                                              ("Non-BFRB", ~pl.col("is_bfrb"))]):
+        # treat -1.0 as null so it doesn't drag the mean down
+        mean_vals = (
+            train_df.filter(mask)
+            .select([
+                pl.when(pl.col(c) == -1.0).then(None).otherwise(pl.col(c)).mean().alias(c)
+                for c in tof_cols_s
+            ])
+            .row(0)
+        )
+        grid = np.array(mean_vals, dtype=float).reshape(8, 8)
+
+        ax = axes[s_idx][row_idx]
+        im = ax.imshow(grid, cmap="hot", aspect="auto")
+        ax.set_title(f”tof_{sensor}: {label}”, fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+plt.tight_layout()
+plt.show()
+```
+
+14. Is there meaningful signal in the Pause or Transition phases, or is the Gesture phase doing most of the discriminative work?
+
+```{python}
+#| echo: false
+print("Phases present:", train_df["phase"].unique().sort().to_list())
+
+phase_signal = (
+    train_df
+    .with_columns(
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).alias("avg_thm"),
+        pl.mean_horizontal([pl.col(c).abs() for c in ["acc_x","acc_y","acc_z"]]).alias("acc_mag"),
+    )
+    .group_by("phase", "is_bfrb")
+    .agg(
+        pl.col("avg_thm").mean(),
+        pl.col("acc_mag").mean(),
+        pl.len().alias("n_rows")
+    )
+    .sort("phase", "is_bfrb")
+)
+print(phase_signal)
+
+# box plot: BFRB vs non-BFRB thm separation per phase
+df_plot = (
+    train_df
+    .with_columns(pl.mean_horizontal([pl.col(c) for c in thm_cols]).alias("avg_thm"))
+    .select(["phase", "is_bfrb", "avg_thm"])
+    .to_pandas()
+)
+phases = sorted(df_plot["phase"].unique())
+fig, ax = plt.subplots(figsize=(8, 5))
+positions, labels_x = [], []
+for i, phase in enumerate(phases):
+    for j, (flag, label, color) in enumerate([(False, "Non-BFRB", "orange"), (True, "BFRB", "steelblue")]):
+        pos = i * 3 + j
+        data = df_plot[(df_plot["phase"] == phase) & (df_plot["is_bfrb"] == flag)]["avg_thm"].dropna()
+        bp = ax.boxplot(data, positions=[pos], widths=0.7, patch_artist=True,
+                        boxprops=dict(facecolor=color, alpha=0.6),
+                        medianprops=dict(color="black"),
+                        whiskerprops=dict(alpha=0.4), capprops=dict(alpha=0.4),
+                        flierprops=dict(alpha=0.05, markersize=1))
+    labels_x.append(i * 3 + 0.5)
+
+ax.set_xticks([i * 3 + 0.5 for i in range(len(phases))])
+ax.set_xticklabels(phases)
+ax.set_ylabel("avg thermopile (°C)")
+ax.set_title("Thermopile Separation by Phase (orange=Non-BFRB, blue=BFRB)")
+from matplotlib.patches import Patch
+ax.legend(handles=[Patch(facecolor="steelblue", alpha=0.6, label="BFRB"),
+                   Patch(facecolor="orange", alpha=0.6, label="Non-BFRB")])
+plt.tight_layout()
+plt.show()
+
+# acc_mag alone is flat; is there any IMU feature separating the classes?
+# test jerk (rate of change of acceleration) and rotation variance, both per sequence
+imu_seq_features = (
+    train_df
+    .with_columns(
+        pl.mean_horizontal([pl.col(c).abs() for c in ["acc_x","acc_y","acc_z"]]).alias("acc_mag")
+    )
+    .sort("sequence_id", "sequence_counter")
+    .with_columns(
+        (pl.col("acc_mag") - pl.col("acc_mag").shift(1).over("sequence_id")).abs().alias("acc_jerk")
+    )
+    .group_by("sequence_id")
+    .agg(
+        pl.col("acc_mag").std().alias("acc_mag_std"),
+        pl.col("acc_jerk").mean().alias("acc_jerk_mean"),
+        pl.col("rot_x").std().alias("rot_x_std"),
+        pl.col("rot_y").std().alias("rot_y_std"),
+        pl.col("rot_z").std().alias("rot_z_std"),
+        pl.col("is_bfrb").first(),
+    )
+)
+
+candidate_features = ["acc_mag_std", "acc_jerk_mean", "rot_x_std", "rot_y_std", "rot_z_std"]
+feature_comparison = (
+    imu_seq_features
+    .group_by("is_bfrb")
+    .agg([pl.col(f).mean().alias(f) for f in candidate_features])
+)
+print("Sequence-level IMU feature means, BFRB vs Non-BFRB:")
+print(feature_comparison)
+
+# effect size (Cohen's d) per feature to rank discriminative power
+pdf_imu = imu_seq_features.to_pandas()
+print("\nEffect size (Cohen's d) per candidate IMU feature:")
+for f in candidate_features:
+    g1 = pdf_imu[pdf_imu["is_bfrb"]][f].dropna()
+    g0 = pdf_imu[~pdf_imu["is_bfrb"]][f].dropna()
+    pooled_std = np.sqrt(((g1.std()**2) + (g0.std()**2)) / 2)
+    d = (g1.mean() - g0.mean()) / pooled_std if pooled_std > 0 else 0
+    print(f"  {f}: d = {d:.3f}")
+```
+
+## Subject and Demographic Variation
+
+15. Do signal ranges vary substantially across subjects, what does subject-level normalization look like?
+
+```{python}
+#| echo: false
+subj_stats = (
+    train_df
+    .group_by("subject")
+    .agg([
+        pl.col("acc_x").mean().alias("acc_x_mean"),
+        pl.col("acc_x").std().alias("acc_x_std"),
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean().alias("thm_mean"),
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).std().alias("thm_std"),
+        pl.col("rot_w").is_null().mean().alias("rot_null_rate"),
+        pl.col("thm_5").is_null().mean().alias("thm5_null_rate"),
+        pl.len().alias("n_rows"),
+        pl.col("sequence_id").n_unique().alias("n_sequences"),
+    ])
+)
+
+thm_mean_vals = subj_stats["thm_mean"].drop_nulls()
+print(f"Per-subject thm_mean: min={thm_mean_vals.min():.1f}°C  max={thm_mean_vals.max():.1f}°C  "
+      f"range={thm_mean_vals.max() - thm_mean_vals.min():.1f}°C  std={thm_mean_vals.std():.2f}°C")
+
+# apply subject-level z-score normalization
+train_df = train_df.with_columns([
+    ((pl.col(c) - pl.col(c).mean().over("subject")) /
+     pl.col(c).std().over("subject")).alias(f"{c}_znorm")
+    for c in thm_cols
+])
+
+# show before/after
+sample_subj = subj_stats.sort("thm_mean").head(1)["subject"][0]
+raw_mean = train_df.filter(pl.col("subject") == sample_subj)["thm_1"].mean()
+znorm_mean = train_df.filter(pl.col("subject") == sample_subj)["thm_1_znorm"].mean()
+print(f"\nExample (coldest subject {sample_subj}): raw thm_1 mean = {raw_mean:.2f}  znorm mean = {znorm_mean:.2f}")
+
+fig, axes = plt.subplots(2, 1, figsize=(8, 4))
+fig.suptitle("Subject-Level Signal Variation")
+axes[0].hist(subj_stats["thm_mean"].to_numpy(), bins=40)
+axes[0].set_xlabel("Per-subject mean thermopile (°C)")
+axes[0].set_ylabel("# subjects")
+axes[0].set_title(f"Thermopile mean (range {thm_mean_vals.max()-thm_mean_vals.min():.1f}°C)")
+axes[1].hist(subj_stats["thm_std"].to_numpy(), bins=40)
+axes[1].set_xlabel("Per-subject std thermopile (°C)")
+axes[1].set_title("Thermopile std across subjects")
+plt.tight_layout()
+plt.show()
+```
+
+16. Are there demographic patterns (age, arm length, sex) that correlate with signal amplitude or gesture quality?
+
+
+```{python}
+#| echo: false
+demo_df = pl.read_csv("../data/train_demographics.csv")
+subj_demo = subj_stats.join(demo_df, on="subject", how="left")
+
+corr_cols = ["thm_mean", "thm_std", "acc_x_mean", "age",
+             "height_cm", "shoulder_to_wrist_cm", "elbow_to_wrist_cm",
+             "adult_child", "sex", "handedness"]
+
+corr_matrix = subj_demo.select(corr_cols).to_pandas().corr()
+
+# print strongest correlations with signal columns
+print("Top correlations with thm_mean:")
+print(corr_matrix["thm_mean"].drop("thm_mean").abs().sort_values(ascending=False).to_string())
+
+fig, ax = plt.subplots(figsize=(7, 7))
+im = ax.imshow(corr_matrix, cmap="coolwarm", vmin=-1, vmax=1)
+ax.set_xticks(range(len(corr_cols)))
+ax.set_yticks(range(len(corr_cols)))
+ax.set_xticklabels(corr_cols, rotation=45, ha="right", fontsize=8)
+ax.set_yticklabels(corr_cols, fontsize=8)
+plt.colorbar(im)
+ax.set_title("Demographic × Signal Correlation")
+plt.tight_layout()
+plt.show()
+```
+
+joining demographics columns into train and test df's
+
+```{python}
+#| echo: false
+demo_df = pl.read_csv("../data/train_demographics.csv")
+train_df = train_df.join(demo_df, on="subject", how="left")
+
+test_demo_df = pl.read_csv("../data/test_demographics.csv")
+test_df = test_df.join(test_demo_df, on="subject", how="left")
+
+# resolve the handedness confound found in Q16: left-handed subjects show a different
+# acc_x orientation, which would otherwise be encoded as noise by any rolling-window feature.
+# mirror the x-axis (acc_x, rot_x) for left-handed subjects so all subjects share one orientation convention.
+before_gap = (
+    train_df.group_by("handedness")
+    .agg(pl.col("acc_x").mean().alias("acc_x_mean"))
+    .sort("handedness")
+)
+print("acc_x_mean by handedness BEFORE mirroring:")
+print(before_gap)
+
+for df_name, df in [("train_df", train_df), ("test_df", test_df)]:
+    mirrored = df.with_columns([
+        pl.when(pl.col("handedness") == 0).then(-pl.col("acc_x")).otherwise(pl.col("acc_x")).alias("acc_x"),
+        pl.when(pl.col("handedness") == 0).then(-pl.col("rot_x")).otherwise(pl.col("rot_x")).alias("rot_x"),
+    ])
+    if df_name == "train_df":
+        train_df = mirrored
+    else:
+        test_df = mirrored
+
+after_gap = (
+    train_df.group_by("handedness")
+    .agg(pl.col("acc_x").mean().alias("acc_x_mean"))
+    .sort("handedness")
+)
+print("\nacc_x_mean by handedness AFTER mirroring:")
+print(after_gap)
+```
+
+17. Are any subjects outliers whose data looks corrupted or implausible?
+
+```{python}
+#| echo: false
+pdf = subj_demo.to_pandas()
+
+for col in ["thm_mean", "acc_x_mean"]:
+    pdf[f"{col}_z"] = (pdf[col] - pdf[col].mean()) / pdf[col].std()
+
+outliers = pdf[
+    (pdf["thm_mean_z"].abs() > 3) |
+    (pdf["acc_x_mean_z"].abs() > 3) |
+    (pdf["rot_null_rate"] > 0.5) |
+    (pdf["thm5_null_rate"] == 1.0)
+][["subject", "thm_mean", "thm_mean_z", "acc_x_mean", "acc_x_mean_z",
+   "n_rows", "rot_null_rate", "thm5_null_rate", "age", "handedness"]].sort_values("thm_mean")
+
+print(f"Flagged outlier subjects: {len(outliers)}")
+print(outliers.to_string(index=False))
+
+# flag suspect subjects (those with thm_mean z < -3)
+suspect_subjects = set(outliers[outliers["thm_mean_z"] < -3]["subject"].tolist())
+print(f"Suspect subjects (thermopile z < -3): {suspect_subjects}")
+
+train_df = train_df.with_columns(
+    pl.col("subject").is_in(suspect_subjects).cast(pl.Int8).alias("is_suspect_subject")
+)
+```
+
+## Validation
+
+Does the Q12 thermopile warmth gap (BFRB vs. Non-BFRB) survive excluding the suspect subjects flagged in Q17? SUBJ_028998 and SUBJ_036405 read 4–5°C colder than everyone else and are disproportionately likely to fall in the non-BFRB baseline by chance, which could be inflating the apparent gap.
+
+```{python}
+#| echo: false
+def thm_gap(df, label):
+    bfrb_mean = df.filter(pl.col("is_bfrb")).select(
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean()).item()
+    non_bfrb_mean = df.filter(~pl.col("is_bfrb")).select(
+        pl.mean_horizontal([pl.col(c) for c in thm_cols]).mean()).item()
+    gap = bfrb_mean - non_bfrb_mean
+    print(f"{label}: BFRB={bfrb_mean:.2f}°C  Non-BFRB={non_bfrb_mean:.2f}°C  Gap={gap:.2f}°C")
+    return gap
+
+gap_all = thm_gap(train_df, "All subjects (original Q12 result)")
+gap_clean = thm_gap(train_df.filter(~pl.col("subject").is_in(suspect_subjects)), "Excluding suspect subjects")
+
+pct_change = abs(gap_all - gap_clean) / gap_all * 100
+print(f"\nGap change after exclusion: {pct_change:.1f}%")
+```
